@@ -421,6 +421,50 @@ pytest -q
 
 测试使用 mock obipcr，不依赖真实 OBITools4 环境。
 
+## GUI usage
+
+fullpcr provides a Streamlit-based graphical interface for the complete analysis workflow.
+
+### Install GUI dependencies
+
+```bash
+pip install -e ".[gui]"
+```
+
+### Launch
+
+**Method 1 — direct streamlit invocation:**
+
+```bash
+streamlit run fullpcr/gui_app.py
+```
+
+**Method 2 — fullpcr CLI subcommand:**
+
+```bash
+python -m fullpcr gui
+```
+
+Both methods are equivalent. Method 2 provides a clear error message with install instructions if streamlit is missing.
+
+### GUI pages
+
+| Page | Function |
+|------|----------|
+| **Environment** | Check Python / fullpcr / obipcr / MFEprimer availability |
+| **Inputs** | Validate primers.tsv, database.fasta, taxonomy.tsv file formats |
+| **Workflow** | Run the 5-step pipeline: qc-pre → qc-summary → qc-spec → obipcr → final-report |
+| **Results** | Browse primer_rank.tsv, view final_score bar charts, inspect QC & spec status tables |
+| **Reports** | View final_report.md and obipcr report.md as rendered Markdown |
+
+### Recommended GUI workflow
+
+1. **Environment** page — verify all external dependencies are available
+2. **Inputs** page — validate input file formats and preview data
+3. **Workflow** page — execute each step in order (use Dry-run mode to preview commands first)
+4. **Results** page — review primer rankings, scores, and status breakdowns
+5. **Reports** page — read the final evaluation report and obipcr report
+
 ## 已知限制
 
 1. **In silico PCR 不能替代真实 PCR**。生物样本中的引物表现可能因 DNA 质量、抑制剂、退火条件等而不同。最终引物选择需要 wet-lab PCR 和测序验证。

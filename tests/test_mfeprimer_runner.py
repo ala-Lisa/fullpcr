@@ -52,6 +52,10 @@ class TestCheckMfeprimerAvailable:
         result = check_mfeprimer_available()
         assert isinstance(result, bool)
 
+    @pytest.mark.skipif(
+        check_mfeprimer_available(),
+        reason="MFEprimer is installed — test only valid in CI without MFEprimer",
+    )
     def test_is_false_in_ci(self):
         """MFEprimer is not installed in this environment."""
         assert check_mfeprimer_available() is False

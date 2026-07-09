@@ -754,6 +754,44 @@ def run_final_report(args: argparse.Namespace) -> None:
     print("Done.")
 
 
+def run_gui() -> None:
+    """Launch the Streamlit GUI app."""
+    import shutil
+    import subprocess
+
+    if shutil.which("streamlit") is None:
+        print(
+            "错误: streamlit 未安装。\n"
+            "Please install GUI dependencies with:\n"
+            '  pip install -e ".[gui]"',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    gui_app_path = Path(__file__).resolve().parent / "gui_app.py"
+    if not gui_app_path.is_file():
+        print(
+            f"错误: GUI app 文件不存在: {gui_app_path}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    cmd: list[str] = ["streamlit", "run", str(gui_app_path)]
+
+    try:
+        subprocess.run(cmd, check=False)
+    except FileNotFoundError:
+        print(
+            "错误: streamlit 未找到。\n"
+            "Please install GUI dependencies with:\n"
+            '  pip install -e ".[gui]"',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nGUI 已停止。")
+
+
 def main(argv: list[str] | None = None) -> None:
     """Parse CLI args and dispatch to the appropriate subcommand."""
     parser = argparse.ArgumentParser(
@@ -1061,6 +1099,12 @@ def main(argv: list[str] | None = None) -> None:
         help="Output directory for final report files",
     )
 
+    # -- gui -----------------------------------------------------------
+    subparsers.add_parser(
+        "gui",
+        help="Launch the fullpcr Streamlit GUI",
+    )
+
     args = parser.parse_args(argv)
 
     if args.command is None:
@@ -1086,6 +1130,8 @@ def main(argv: list[str] | None = None) -> None:
         run_qc_spec(args)
     elif args.command == "final-report":
         run_final_report(args)
+    elif args.command == "gui":
+        run_gui()
     else:
         parser.print_help()
         sys.exit(1)

@@ -16,6 +16,10 @@ dependencies = [
 dev = [
     "pytest",
 ]
+gui = [
+    "streamlit",
+    "pandas",
+]
 
 [tool.setuptools.packages.find]
 include = ["fullpcr*"]
