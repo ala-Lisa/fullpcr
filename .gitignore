@@ -1,0 +1,42 @@
+# Python cache
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Results and QC output directories
+results*/
+qc_results*/
+qc_spec*/
+final_results*/
+*_results/
+*_smoke/
+
+# MFEprimer index files
+*.primerqc
+*.primerqc.fai
+*.fai
+*.mfe.log
+
+# Logs
+*.stderr.log
+*.log
+
+# Compressed FASTA
+*.fasta.gz
+*.fa.gz
+
+# Egg info (build artifact)
+*.egg-info/
+
+# Protected: example_data essentials
+!example_data/primers.tsv
+!example_data/*taxonomy.tsv
+
+# Protected: project files
+!README.md
+!CLAUDE.md
+!pyproject.toml
+
+# Protected: source
+!tests/
+!fullpcr/

@@ -1,0 +1,7 @@
+taxid	scientific_name	kingdom	phylum	class	order	family	genus	species
+9606	Homo sapiens	Animalia	Chordata	Mammalia	Primates	Hominidae	Homo	Homo sapiens
+9913	Bos taurus	Animalia	Chordata	Mammalia	Cetartiodactyla	Bovidae	Bos	Bos taurus
+10090	Mus musculus	Animalia	Chordata	Mammalia	Rodentia	Muridae	Mus	Mus musculus
+7955	Danio rerio	Animalia	Chordata	Actinopterygii	Cypriniformes	Cyprinidae	Danio	Danio rerio
+7227	Drosophila melanogaster	Animalia	Arthropoda	Insecta	Diptera	Drosophilidae	Drosophila	Drosophila melanogaster
+8364	Xenopus tropicalis	Animalia	Chordata	Amphibia	Anura	Pipidae	Xenopus	Xenopus tropicalis
