@@ -28,6 +28,9 @@ from fullpcr.gui_helpers import (
     run_gui_command,
     summarize_primer_rank,
     summarize_status_counts,
+    translate_recommendation,
+    translate_status,
+    translate_warning_label,
     validate_database_file,
     validate_file_exists,
     validate_output_directory,
@@ -844,3 +847,92 @@ class TestSummarizeStatusCounts:
         assert result["counts"] is not None
         assert "NA" in result["counts"]
         assert result["counts"]["NA"] == 2
+
+
+# ── Phase 6A: Chinese translation tests ─────────────────────────────────
+
+
+class TestTranslateStatus:
+    """Tests for translate_status()."""
+
+    def test_known_values(self):
+        assert translate_status("PASS") == "正常"
+        assert translate_status("FAIL") == "异常"
+        assert translate_status("WARN") == "警告"
+        assert translate_status("TIMEOUT") == "超时"
+
+    def test_unknown_value_preserved(self):
+        assert translate_status("UNKNOWN") == "UNKNOWN"
+        assert translate_status("success") == "success"
+
+    def test_none_returns_empty(self):
+        assert translate_status(None) == ""
+
+    def test_empty_string_preserved(self):
+        assert translate_status("") == ""
+
+    def test_non_string_preserved(self):
+        assert translate_status(42) == "42"
+
+
+class TestTranslateRecommendation:
+    """Tests for translate_recommendation()."""
+
+    def test_known_values(self):
+        assert translate_recommendation("RECOMMENDED") == "推荐"
+        assert translate_recommendation("ACCEPTABLE_WITH_WARNINGS") == "可用但有警告"
+        assert translate_recommendation("NOT_RECOMMENDED") == "不推荐"
+        assert translate_recommendation("NEEDS_REVIEW") == "需要人工检查"
+
+    def test_unknown_value_preserved(self):
+        assert translate_recommendation("EXCELLENT") == "EXCELLENT"
+
+    def test_none_returns_empty(self):
+        assert translate_recommendation(None) == ""
+
+    def test_empty_string_preserved(self):
+        assert translate_recommendation("") == ""
+
+
+class TestTranslateWarningLabel:
+    """Tests for translate_warning_label()."""
+
+    def test_known_single_labels(self):
+        assert translate_warning_label("PASS") == "通过"
+        assert translate_warning_label("WARN_DIMER") == "引物二聚体警告"
+        assert translate_warning_label("WARN_HAIRPIN") == "发卡结构警告"
+        assert translate_warning_label("WARN_TM_DIFF") == "Tm 差异偏大"
+        assert translate_warning_label("WARN_NO_AMP") == "未检测到扩增"
+        assert translate_warning_label("WARN_MULTI_AMP") == "存在多个扩增产物"
+        assert translate_warning_label("WARN_SIZE") == "扩增片段长度异常"
+        assert translate_warning_label("WARN_OVERAMP") == "过度扩增"
+        assert translate_warning_label("FAIL_PARSE") == "解析失败"
+        assert translate_warning_label("FAIL_DEGENERATE_EXPLOSION") == "简并引物展开爆炸"
+        assert translate_warning_label("FAIL_INDEX") == "索引构建失败"
+        assert translate_warning_label("FAIL_SPEC") == "特异性分析失败"
+
+    def test_compound_values(self):
+        result = translate_warning_label("WARN_DIMER; WARN_HAIRPIN")
+        assert "引物二聚体警告" in result
+        assert "发卡结构警告" in result
+
+    def test_mixed_known_unknown_compound(self):
+        result = translate_warning_label("WARN_DIMER; UNKNOWN_WARN")
+        assert "引物二聚体警告" in result
+        assert "UNKNOWN_WARN" in result
+
+    def test_unknown_value_preserved(self):
+        assert translate_warning_label("SOME_RANDOM") == "SOME_RANDOM"
+
+    def test_none_returns_empty(self):
+        assert translate_warning_label(None) == ""
+
+    def test_empty_string_preserved(self):
+        assert translate_warning_label("") == ""
+
+    def test_other_known_labels(self):
+        assert translate_warning_label("NO_DEGENERACY") == "无简并碱基"
+        assert translate_warning_label("EXPANDED") == "已展开"
+        assert translate_warning_label("INVALID_BASE") == "无效碱基"
+        assert translate_warning_label("OK") == "正常"
+        assert translate_warning_label("NA") == "无数据"

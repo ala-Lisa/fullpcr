@@ -20,6 +20,113 @@ from pathlib import Path
 import pandas as pd
 
 
+# ── Chinese translation helpers (display-layer only) ──────────────────
+
+
+def translate_status(value: str | None) -> str:
+    """Translate generic PASS/FAIL/WARN/TIMEOUT to Chinese.
+
+    Used for command execution results, validation status, and
+    file-load status — **not** for final_status (RECOMMENDED, etc.)
+    or qc_status/spec_status sub-warnings.
+
+    Args:
+        value: Status string such as ``"PASS"``, ``"FAIL"``, ``"WARN"``,
+            ``"TIMEOUT"``, or ``None``.
+
+    Returns:
+        Chinese label, or the original string when no mapping exists.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return str(value)
+    mapping: dict[str, str] = {
+        "PASS": "正常",
+        "FAIL": "异常",
+        "WARN": "警告",
+        "TIMEOUT": "超时",
+    }
+    return mapping.get(value, value)
+
+
+def translate_recommendation(value: str | None) -> str:
+    """Translate final_status recommendation tier to Chinese.
+
+    Used for the ``final_status`` column in ``primer_rank.tsv``
+    (RECOMMENDED / ACCEPTABLE_WITH_WARNINGS / NOT_RECOMMENDED /
+    NEEDS_REVIEW).  Applied only on the display copy — the original
+    TSV is never modified.
+
+    Args:
+        value: One of the four ``final_status`` strings, or ``None``.
+
+    Returns:
+        Chinese label, or the original string when no mapping exists.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return str(value)
+    mapping: dict[str, str] = {
+        "RECOMMENDED": "推荐",
+        "ACCEPTABLE_WITH_WARNINGS": "可用但有警告",
+        "NOT_RECOMMENDED": "不推荐",
+        "NEEDS_REVIEW": "需要人工检查",
+    }
+    return mapping.get(value, value)
+
+
+def translate_warning_label(value: str | None) -> str:
+    """Translate WARN_* / FAIL_* sub-status labels to Chinese.
+
+    Used for qc_status and spec_status sub-strings (e.g.
+    ``"WARN_DIMER"``, ``"FAIL_SPEC"``).  Supports semicolon-delimited
+    compound values such as ``"WARN_DIMER; WARN_HAIRPIN"``.
+
+    Args:
+        value: A single status token, a ``"; "``-delimited compound
+            string, or ``None``.
+
+    Returns:
+        Comma-joined Chinese labels for compound values, a single
+        Chinese label for a known token, or the original string when
+        no mapping exists.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return str(value)
+
+    mapping: dict[str, str] = {
+        "PASS": "通过",
+        "WARN_DIMER": "引物二聚体警告",
+        "WARN_HAIRPIN": "发卡结构警告",
+        "WARN_TM_DIFF": "Tm 差异偏大",
+        "WARN_NO_AMP": "未检测到扩增",
+        "WARN_MULTI_AMP": "存在多个扩增产物",
+        "WARN_SIZE": "扩增片段长度异常",
+        "WARN_OVERAMP": "过度扩增",
+        "FAIL_PARSE": "解析失败",
+        "FAIL_DEGENERATE_EXPLOSION": "简并引物展开爆炸",
+        "FAIL_INDEX": "索引构建失败",
+        "FAIL_SPEC": "特异性分析失败",
+        "NO_DEGENERACY": "无简并碱基",
+        "EXPANDED": "已展开",
+        "INVALID_BASE": "无效碱基",
+        "OK": "正常",
+        "NA": "无数据",
+    }
+
+    # Compound status like "WARN_DIMER; WARN_HAIRPIN"
+    if "; " in value:
+        parts = value.split("; ")
+        translated = [mapping.get(p, p) for p in parts]
+        return "；".join(translated)
+
+    return mapping.get(value, value)
+
+
 def check_command_available(command: list[str]) -> dict:
     """Check whether an external command is available.
 
