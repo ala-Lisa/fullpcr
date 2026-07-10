@@ -451,19 +451,18 @@ Both methods are equivalent. Method 2 provides a clear error message with instal
 
 | Page | Function |
 |------|----------|
-| **Environment** | Check Python / fullpcr / obipcr / MFEprimer availability |
-| **Inputs** | Validate primers.tsv, database.fasta, taxonomy.tsv file formats |
-| **Workflow** | Run the 5-step pipeline: qc-pre → qc-summary → qc-spec → obipcr → final-report |
-| **Results** | Browse primer_rank.tsv, view final_score bar charts, inspect QC & spec status tables |
-| **Reports** | View final_report.md and obipcr report.md as rendered Markdown |
+| **分析工作台** (Analysis Workbench) | Merged page: validate input files, configure analysis parameters, preset selection, run the 5-step pipeline (qc-pre → qc-summary → qc-spec → obipcr → final-report) across tabs |
+| **结果总览** (Results Overview) | Browse primer_rank.tsv, view final_score bar charts, inspect QC & spec status tables |
+| **报告与下载** (Reports & Downloads) | View final_report.md and obipcr report.md as rendered Markdown, download reports |
+
+The header bar includes an **environment popover** (🟢/🔴 indicator) showing Python, fullpcr, obipcr, and MFEprimer availability. It caches results for 60 seconds — click "重新检查环境" to force-refresh.
 
 ### Recommended GUI workflow
 
-1. **Environment** page — verify all external dependencies are available
-2. **Inputs** page — validate input file formats and preview data
-3. **Workflow** page — execute each step in order (use Dry-run mode to preview commands first)
-4. **Results** page — review primer rankings, scores, and status breakdowns
-5. **Reports** page — read the final evaluation report and obipcr report
+1. Click the environment popover in the header to verify all external dependencies are available
+2. **分析工作台** — validate input file formats, apply a primer preset, preview commands in dry-run mode, then execute each step in order
+3. **结果总览** — review primer rankings, scores, and status breakdowns
+4. **报告与下载** — read the final evaluation report and obipcr report, download as needed
 
 ## 已知限制
 

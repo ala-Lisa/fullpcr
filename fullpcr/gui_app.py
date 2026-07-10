@@ -1,4 +1,4 @@
-"""fullpcr Streamlit GUI — Phase 6B: 路径联动 + 统一目录 + 参数预设.
+"""fullpcr Streamlit GUI — Phase 7A: IA restructure + env popover + tabs.
 
 Launch with::
 
@@ -14,6 +14,7 @@ import pandas as pd
 import streamlit as st
 
 from fullpcr.gui_helpers import (
+    _WORKFLOW_PATH_MAP,
     apply_primer_preset_to_state,
     apply_project_paths_to_state,
     build_final_report_command,
@@ -22,6 +23,7 @@ from fullpcr.gui_helpers import (
     build_qc_spec_command,
     build_qc_summary_command,
     check_command_available,
+    collect_environment_status,
     compute_inputs_validated,
     derive_project_paths,
     ensure_widget_key,
@@ -33,6 +35,7 @@ from fullpcr.gui_helpers import (
     load_primer_rank,
     load_tsv_file,
     run_gui_command,
+    should_refresh_environment_status,
     summarize_primer_rank,
     summarize_status_counts,
     sync_widgets_to_canonical,
@@ -46,7 +49,10 @@ from fullpcr.gui_helpers import (
     validate_taxonomy_file,
 )
 
-# ── helper: render a validation result card ──────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Render helpers
+# ═══════════════════════════════════════════════════════════════════════════
 
 
 def _render_file_validation(
@@ -98,137 +104,188 @@ def _render_file_validation(
             st.caption(f"字段: {', '.join(preview_rows[0])}")
 
 
-# ── page config ──────────────────────────────────────────────────────────
+# ── header ─────────────────────────────────────────────────────────────────
 
-st.set_page_config(
-    page_title="fullpcr 引物评测平台",
-    page_icon="🧬",
-    layout="wide",
-)
 
-# ── cross-page persistence: canonical defaults ─────────────────────────
+def _render_header() -> None:
+    """Two-column top bar: project info (left) + environment popover (right)."""
+    col_left, col_right = st.columns([3, 1])
 
-init_canonical_defaults(st.session_state)
+    with col_left:
+        st.markdown("## 🧬 fullpcr 全库引物评测平台")
+        st.caption("基于 OBITools4 obipcr 和 MFEprimer 的全库引物评测工具")
 
-# ── main title ───────────────────────────────────────────────────────────
-
-st.title("fullpcr 全库引物评测平台")
-st.markdown("基于 OBITools4 obipcr 和 MFEprimer 的全库引物评测工具")
-st.divider()
-
-# ── sidebar navigation ───────────────────────────────────────────────────
-
-st.sidebar.title("🧬 fullpcr")
-
-page = st.sidebar.radio(
-    "导航",
-    ["环境检查", "输入文件", "分析流程", "结果总览", "报告查看"],
-    index=0,
-)
-
-st.sidebar.markdown("---")
-st.sidebar.caption("v0.1.0 — GUI Phase 6B")
-
-# ── Environment page ─────────────────────────────────────────────────────
-
-if page == "环境检查":
-    st.header("环境检查")
-    st.markdown("检查 fullpcr 运行所需的软件和环境。")
-
-    # ── summary section ───────────────────────────────────────────────
-
-    py_info = get_python_info()
-    fp_info = get_fullpcr_info()
-    obi = check_command_available(["obipcr", "--version"])
-    mfe = check_command_available(["mfeprimer", "version"])
-
-    checks = [
-        ("Python", True, py_info["executable"]),
-        ("fullpcr", fp_info["importable"], fp_info.get("version", "N/A")),
-        ("obipcr", obi["available"], obi.get("version")),
-        ("MFEprimer", mfe["available"], mfe.get("version")),
-    ]
-
-    ok_count = sum(1 for _, ok, _ in checks if ok)
-    fail_count = len(checks) - ok_count
-
-    col_sum1, col_sum2, col_sum3 = st.columns(3)
-    with col_sum1:
-        st.metric("环境正常", ok_count)
-    with col_sum2:
-        st.metric("环境异常", fail_count)
-    with col_sum3:
-        if fail_count == 0:
-            st.success("可运行完整流程")
+        # Current project indicator
+        project_root = (
+            st.session_state.get("project_output_root")
+            or st.session_state.get("inputs_output_dir")
+            or ""
+        )
+        if project_root:
+            st.caption(f"📁 当前项目: `{project_root}`")
         else:
-            st.warning("部分功能不可用")
+            st.caption("📁 当前项目: 未设置")
 
-    st.divider()
+    with col_right:
+        _render_environment_popover()
 
-    # ── Python ─────────────────────────────────────────────────────────
 
-    st.subheader("Python 环境")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("状态", "✓ 可用")
-    with col2:
-        st.metric("可执行文件", py_info["executable"])
-    with st.expander("版本详情"):
-        st.code(py_info["version"], language=None)
+# ── environment popover ──────────────────────────────────────────────────────
 
-    st.divider()
 
-    # ── fullpcr ────────────────────────────────────────────────────────
+def _render_environment_popover() -> None:
+    """Cached environment status displayed in a ``st.popover``.
 
-    st.subheader("fullpcr 程序")
-    if fp_info["importable"]:
-        st.success("fullpcr 可正常导入")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("版本", fp_info.get("version", "N/A"))
-        with col2:
-            st.metric("路径", fp_info.get("path", "N/A"))
+    Reads/updates ``environment_status`` and ``environment_checked_at``
+    in ``st.session_state``.  External commands are only re-run when the
+    60-second TTL has expired or the user clicks 重新检查环境.
+    """
+    import time
+
+    now = time.time()
+    checked_at: float | None = st.session_state.get("environment_checked_at")
+    status: dict | None = st.session_state.get("environment_status")
+
+    # Determine if a refresh is needed.
+    force_refresh = st.session_state.pop("_env_force_refresh", False)
+    needs_refresh = force_refresh or should_refresh_environment_status(checked_at, now)
+
+    if needs_refresh or status is None:
+        status = collect_environment_status()
+        st.session_state["environment_status"] = status
+        st.session_state["environment_checked_at"] = status["checked_at"]
+
+    ok_count: int = status["ok_count"]
+    fail_count: int = status["fail_count"]
+
+    # Popover trigger label.
+    if fail_count == 0:
+        trigger_label = "🟢 环境正常"
     else:
-        st.error(f"fullpcr 导入失败: {fp_info['error']}")
+        trigger_label = f"🔴 环境异常 ({fail_count})"
 
-    st.divider()
+    with st.popover(trigger_label, width="stretch"):
+        st.markdown("### 环境检查")
 
-    # ── obipcr ─────────────────────────────────────────────────────────
+        # Summary metrics
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("正常", ok_count)
+        with c2:
+            st.metric("异常", fail_count)
 
-    st.subheader("obipcr")
-    if obi["available"]:
-        st.success("obipcr 可用")
-        if obi["version"]:
-            st.caption(obi["version"])
-    else:
-        st.error(obi["error"] or "obipcr 不可用")
+        if fail_count == 0:
+            st.success("✅ 满足完整运行条件")
+        else:
+            st.warning("⚠ 部分功能不可用")
 
-    st.divider()
+        st.divider()
 
-    # ── MFEprimer ──────────────────────────────────────────────────────
+        # Python
+        py_info: dict = status["python"]
+        st.markdown("**Python**")
+        st.caption(f"可执行文件: `{py_info['executable']}`")
+        with st.expander("版本详情"):
+            st.code(py_info["version"], language=None)
 
-    st.subheader("MFEprimer")
-    if mfe["available"]:
-        st.success("MFEprimer 可用")
-        if mfe["version"]:
-            st.caption(mfe["version"])
-    else:
-        st.error(mfe["error"] or "MFEprimer 不可用")
+        # fullpcr
+        fp_info: dict = status["fullpcr"]
+        st.markdown("**fullpcr**")
+        if fp_info["importable"]:
+            st.success(f"✓ 可正常导入 — 版本 {fp_info.get('version', 'N/A')}")
+        else:
+            st.error(f"✗ 导入失败: {fp_info['error']}")
 
-    st.divider()
+        # obipcr
+        obi: dict = status["obipcr"]
+        st.markdown("**obipcr**")
+        if obi["available"]:
+            st.success("✓ 可用")
+            if obi.get("version"):
+                st.caption(obi["version"])
+        else:
+            st.error(f"✗ {obi.get('error', '不可用')}")
 
-    # ── working directory ──────────────────────────────────────────────
+        # MFEprimer
+        mfe: dict = status["mfeprimer"]
+        st.markdown("**MFEprimer**")
+        if mfe["available"]:
+            st.success("✓ 可用")
+            if mfe.get("version"):
+                st.caption(mfe["version"])
+        else:
+            st.error(f"✗ {mfe.get('error', '不可用')}")
 
-    st.subheader("当前工作目录")
-    st.code(os.getcwd(), language=None)
+        # Working directory
+        st.markdown("**当前工作目录**")
+        st.code(status["cwd"], language=None)
 
-# ── Inputs page ──────────────────────────────────────────────────────────
+        st.divider()
 
-elif page == "输入文件":
-    st.header("输入文件")
-    st.markdown("配置引物、参考数据库、分类信息和输出目录。")
+        # Re-check button
+        if st.button("重新检查环境", key="env_recheck_btn"):
+            st.session_state["_env_force_refresh"] = True
+            st.rerun()
 
-    # ── file path inputs ──────────────────────────────────────────────
+
+# ── analysis workbench ───────────────────────────────────────────────────────
+
+
+def _render_analysis_workbench() -> None:
+    """合并后的分析工作台：输入文件 + 验证 + 预设 + 五步流程。"""
+    _render_project_inputs()
+    _render_input_validation_snapshot()
+    common_params = _render_preset_controls()
+    _render_workflow_status_row()
+
+    tab_labels = [
+        "1. 基础质控",
+        "2. 质控汇总",
+        "3. 特异性分析",
+        "4. obipcr",
+        "5. 最终报告",
+    ]
+    tabs = st.tabs(tab_labels)
+
+    with tabs[0]:
+        _render_workflow_step_1()
+    with tabs[1]:
+        _render_workflow_step_2()
+    with tabs[2]:
+        _render_workflow_step_3(common_params)
+    with tabs[3]:
+        _render_workflow_step_4(common_params)
+    with tabs[4]:
+        _render_workflow_step_5()
+
+
+# ── project inputs (formerly 输入文件 page) ──────────────────────────────────
+
+
+def _make_path_edited_callback(canonical_key: str):
+    """Return an on_change callback that marks *canonical_key* as user-edited.
+
+    The callback adds *canonical_key* to the ``workflow_path_user_edited``
+    set in ``st.session_state``.  Used by all 14 workflow path
+    ``st.text_input`` widgets so the first validation can avoid
+    overwriting paths the user has already typed.
+    """
+
+    def _callback() -> None:
+        import streamlit as st_inner
+
+        edited: set[str] = st_inner.session_state.setdefault(
+            "workflow_path_user_edited", set()
+        )
+        edited.add(canonical_key)
+        st_inner.session_state["workflow_path_user_edited"] = edited
+
+    return _callback
+
+
+def _render_project_inputs() -> None:
+    """File path inputs + validate button (same logic as Phase 6B)."""
+    st.subheader("项目与输入文件")
 
     col_left, col_right = st.columns(2)
 
@@ -260,75 +317,17 @@ elif page == "输入文件":
             key="_inputs_output_dir",
         )
 
-    st.divider()
-
-    # ── validate button ───────────────────────────────────────────────
-
     if st.button("验证输入文件", type="primary", key="inputs_validate_btn"):
-        st.subheader("验证结果")
-
         # -- primers ---------------------------------------------------
-        st.markdown("#### 引物文件 (primers.tsv)")
         primers_result = validate_primers_file(primers_path)
-        _render_file_validation(
-            label="primers.tsv",
-            result=primers_result,
-            show_preview=True,
-            preview_caption="前 10 行（含表头）",
-        )
-
         # -- database ---------------------------------------------------
-        st.markdown("#### 参考数据库 (database.fasta)")
         db_result = validate_database_file(database_path)
-        _render_file_validation(
-            label="database",
-            result=db_result,
-            show_preview=False,
-        )
-        if db_result.get("record_count") is not None:
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.metric("FASTA 序列数量", db_result["record_count"])
-            with col_b:
-                st.metric(
-                    "总碱基数",
-                    f"{db_result['total_bases']:,}" if db_result.get("total_bases") else "N/A",
-                )
-
         # -- taxonomy ---------------------------------------------------
-        st.markdown("#### 分类信息 (taxonomy.tsv)")
         tax_result = validate_taxonomy_file(taxonomy_path)
-        _render_file_validation(
-            label="taxonomy.tsv",
-            result=tax_result,
-            show_preview=True,
-            preview_caption="前 10 行（含表头）",
-        )
-        if tax_result.get("record_count") is not None:
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.metric("分类记录数", tax_result["record_count"])
-            with col_b:
-                st.metric(
-                    "物种数量",
-                    tax_result["unique_species"]
-                    if tax_result.get("unique_species") is not None
-                    else "N/A",
-                )
-
         # -- output directory -------------------------------------------
-        st.markdown("#### 输出目录")
         out_result = validate_output_directory(output_dir)
-        out_status = translate_status(out_result["status"])
-        if out_result["status"] == "PASS":
-            st.success(f"✓ 目录已存在 ({out_status}): `{out_result['path']}`")
-        elif out_result.get("will_create"):
-            st.warning(f"后续将自动创建 ({out_status}): `{out_result['path']}`")
-        else:
-            st.error(out_result.get("error", "未知错误"))
 
-        # -- save project paths to session_state (all-or-nothing) ----------
-        # Always recompute — never carry a stale True from a previous run.
+        # Compute validity
         primers_status = primers_result.get("status", "FAIL")
         database_status = db_result.get("status", "FAIL")
         taxonomy_status = tax_result.get("status", "FAIL")
@@ -339,10 +338,11 @@ elif page == "输入文件":
         )
         st.session_state["inputs_validated"] = all_valid
 
+        derived = {}
         if all_valid:
             derived = derive_project_paths(output_dir)
             spec_index_db = ""
-            if derived["qc_spec_results_dir"]:
+            if derived.get("qc_spec_results_dir"):
                 spec_index_db = str(
                     Path(derived["qc_spec_results_dir"]) / "index" / "database.fasta"
                 )
@@ -354,29 +354,65 @@ elif page == "输入文件":
             st.session_state["project_output_root"] = output_dir
             st.session_state["project_derived_paths"] = derived
 
-            # Populate workflow canonical keys WITHOUT overwriting manual edits.
-            apply_project_paths_to_state(
-                st.session_state,
-                {
-                    "output_root": output_dir,
-                    "primers_path": primers_path,
-                    "database_path": database_path,
-                    "taxonomy_path": taxonomy_path,
-                    "qc_results_dir": derived["qc_results_dir"],
-                    "qc_spec_results_dir": derived["qc_spec_results_dir"],
-                    "obipcr_results_dir": derived["obipcr_results_dir"],
-                    "final_results_dir": derived["final_results_dir"],
-                    "spec_index_database": spec_index_db,
-                },
-                overwrite=False,
-            )
-
-            st.success("项目路径已保存，分析流程页面将自动使用这些路径。")
+            # Populate workflow canonical keys with first-init logic.
+            paths_dict = {
+                "output_root": output_dir,
+                "primers_path": primers_path,
+                "database_path": database_path,
+                "taxonomy_path": taxonomy_path,
+                "qc_results_dir": derived.get("qc_results_dir", ""),
+                "qc_spec_results_dir": derived.get("qc_spec_results_dir", ""),
+                "obipcr_results_dir": derived.get("obipcr_results_dir", ""),
+                "final_results_dir": derived.get("final_results_dir", ""),
+                "spec_index_database": spec_index_db,
+            }
+            if not st.session_state.get("workflow_paths_initialized"):
+                # First successful validation: fill canonical keys that the
+                # user has NOT explicitly edited, OR that are currently
+                # empty/None (empty takes priority over user_edited).
+                # Widget keys are also written because the Workflow widgets
+                # may not have been created yet on a fresh session.
+                user_edited: set[str] = st.session_state.get(
+                    "workflow_path_user_edited", set()
+                )
+                for _pk, state_key in _WORKFLOW_PATH_MAP:
+                    current = st.session_state.get(state_key)
+                    current_w = st.session_state.get(f"_{state_key}")
+                    is_empty = (
+                        current is None
+                        or current == ""
+                        or current_w is None
+                        or current_w == ""
+                    )
+                    if state_key not in user_edited or is_empty:
+                        value = paths_dict.get(_pk, "")
+                        if value:
+                            st.session_state[state_key] = value
+                            st.session_state[f"_{state_key}"] = value
+                st.session_state["workflow_paths_initialized"] = True
+            else:
+                # Subsequent validations: record which canonical keys are
+                # currently empty/missing, apply strict overwrite=False
+                # (canonical only, no widget keys), then clean up old empty
+                # temp keys so ensure_widget_key() reloads from canonical
+                # before the Workflow widgets are created.
+                empty_before: set[str] = set()
+                for _pk, state_key in _WORKFLOW_PATH_MAP:
+                    cv = st.session_state.get(state_key)
+                    if cv is None or cv == "":
+                        empty_before.add(state_key)
+                apply_project_paths_to_state(
+                    st.session_state,
+                    paths_dict,
+                    overwrite=False,
+                )
+                for state_key in empty_before:
+                    cv = st.session_state.get(state_key)
+                    if cv is not None and cv != "":
+                        # Filled — remove old empty widget key so
+                        # ensure_widget_key() reloads from canonical.
+                        st.session_state.pop(f"_{state_key}", None)
         else:
-            # Keep the previous project snapshot intact.
-            # Do NOT derive paths, do NOT overwrite project_* keys,
-            # do NOT clear Workflow paths, and do NOT write an empty
-            # taxonomy_path when taxonomy is FAIL.
             failures: list[str] = []
             if primers_status != "PASS":
                 failures.append("引物文件")
@@ -386,42 +422,127 @@ elif page == "输入文件":
                 failures.append("分类信息")
             if output_status not in ("PASS", "WARN"):
                 failures.append("输出目录")
-            st.warning(f"以下输入未通过验证: {', '.join(failures)}。请修正后重新验证。")
 
-        # -- derived paths display ---------------------------------------
-        if st.session_state.get("inputs_validated"):
+        # Save snapshot for display across reruns.
+        st.session_state["input_validation_snapshot"] = {
+            "primers_result": primers_result,
+            "db_result": db_result,
+            "tax_result": tax_result,
+            "out_result": out_result,
+            "all_valid": all_valid,
+            "derived": derived,
+            "failures": failures if not all_valid else [],
+        }
+
+
+# ── input validation snapshot ────────────────────────────────────────────────
+
+
+def _render_input_validation_snapshot() -> None:
+    """Show persisted validation results even after ordinary reruns."""
+    snapshot = st.session_state.get("input_validation_snapshot")
+    if snapshot is None:
+        st.info("点击 **验证输入文件** 检查所有输入文件和路径。")
+        return
+
+    st.divider()
+    st.subheader("验证结果")
+
+    primers_result: dict = snapshot.get("primers_result", {})
+    db_result: dict = snapshot.get("db_result", {})
+    tax_result: dict = snapshot.get("tax_result", {})
+    out_result: dict = snapshot.get("out_result", {})
+    all_valid: bool = snapshot.get("all_valid", False)
+    derived: dict = snapshot.get("derived", {})
+    failures: list[str] = snapshot.get("failures", [])
+
+    # -- primers --
+    st.markdown("#### 引物文件 (primers.tsv)")
+    _render_file_validation(
+        label="primers.tsv",
+        result=primers_result,
+        show_preview=True,
+        preview_caption="前 10 行（含表头）",
+    )
+
+    # -- database --
+    st.markdown("#### 参考数据库 (database.fasta)")
+    _render_file_validation(label="database", result=db_result, show_preview=False)
+    if db_result.get("record_count") is not None:
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.metric("FASTA 序列数量", db_result["record_count"])
+        with col_b:
+            st.metric(
+                "总碱基数",
+                f"{db_result['total_bases']:,}" if db_result.get("total_bases") else "N/A",
+            )
+
+    # -- taxonomy --
+    st.markdown("#### 分类信息 (taxonomy.tsv)")
+    _render_file_validation(
+        label="taxonomy.tsv",
+        result=tax_result,
+        show_preview=True,
+        preview_caption="前 10 行（含表头）",
+    )
+    if tax_result.get("record_count") is not None:
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.metric("分类记录数", tax_result["record_count"])
+        with col_b:
+            st.metric(
+                "物种数量",
+                tax_result["unique_species"]
+                if tax_result.get("unique_species") is not None
+                else "N/A",
+            )
+
+    # -- output directory --
+    st.markdown("#### 输出目录")
+    out_status = translate_status(out_result.get("status", "FAIL"))
+    if out_result.get("status") == "PASS":
+        st.success(f"✓ 目录已存在 ({out_status}): `{out_result.get('path', '')}`")
+    elif out_result.get("will_create"):
+        st.warning(f"后续将自动创建 ({out_status}): `{out_result.get('path', '')}`")
+    elif out_result.get("error"):
+        st.error(out_result.get("error", "未知错误"))
+
+    # -- validation summary --
+    if all_valid:
+        st.success("项目路径已保存，分析流程将自动使用这些路径。")
+        if derived:
             st.markdown("#### 项目输出目录结构（自动派生）")
-            derived = st.session_state.get("project_derived_paths", {})
             st.code(
-                f"{derived.get('output_root', output_dir or 'results')}/\n"
+                f"{derived.get('output_root', 'results')}/\n"
                 f"├── qc_results/          → {derived.get('qc_results_dir', '')}\n"
                 f"├── qc_spec_results/     → {derived.get('qc_spec_results_dir', '')}\n"
                 f"├── obipcr_results/      → {derived.get('obipcr_results_dir', '')}\n"
                 f"└── final_results/        → {derived.get('final_results_dir', '')}\n",
                 language=None,
             )
-        else:
-            st.markdown("#### 项目输出目录结构")
-            st.code(
-                f"{output_dir or 'results'}/\n"
-                f"├── qc_results/          MFEprimer 基础质控\n"
-                f"├── qc_spec_results/     MFEprimer 特异性分析\n"
-                f"├── obipcr_results/      obipcr 全库模拟 PCR\n"
-                f"└── final_results/       最终综合结果\n",
-                language=None,
-            )
-
-    # ── show suggestions even before validation ───────────────────────
+    elif failures:
+        st.warning(f"以下输入未通过验证: {', '.join(failures)}。请修正后重新验证。")
     else:
-        st.info("点击 **验证输入文件** 检查所有输入文件和路径。")
+        output_dir = st.session_state.get("inputs_output_dir", "results")
+        st.markdown("#### 项目输出目录结构")
+        st.code(
+            f"{output_dir or 'results'}/\n"
+            f"├── qc_results/          MFEprimer 基础质控\n"
+            f"├── qc_spec_results/     MFEprimer 特异性分析\n"
+            f"├── obipcr_results/      obipcr 全库模拟 PCR\n"
+            f"└── final_results/       最终综合结果\n",
+            language=None,
+        )
 
-elif page == "分析流程":
-    st.header("分析流程")
-    st.markdown(
-        "按照以下顺序完成引物质控、特异性分析、全库模拟 PCR 和综合报告生成。"
-    )
 
-    # ── sync + preset row ─────────────────────────────────────────────
+# ── preset controls ──────────────────────────────────────────────────────────
+
+
+def _render_preset_controls() -> dict[str, object]:
+    """Sync button, preset selectbox, apply button, and dry-run toggle."""
+    st.divider()
+    st.subheader("分析参数")
 
     sync_col, preset_col, apply_col = st.columns([1, 2, 1])
 
@@ -453,7 +574,7 @@ elif page == "分析流程":
                 )
                 st.success("已同步：所有工作流路径已更新为项目路径。")
             else:
-                st.warning("请先在「输入文件」页面验证输入文件。")
+                st.warning("请先验证输入文件。")
 
     with preset_col:
         preset_options = [
@@ -463,15 +584,12 @@ elif page == "分析流程":
             "Cytb",
             "自定义",
         ]
-        # Use widget key directly — value loaded from canonical via ensure_widget_key.
         ensure_widget_key(st.session_state, "_wf_preset_select")
         selected_preset = st.selectbox(
             "引物类型预设",
             preset_options,
             key="_wf_preset_select",
         )
-
-        # Show preset description
         preset_info = get_primer_preset(selected_preset)
         if selected_preset != "自定义":
             st.caption(f"📋 {preset_info['description']}")
@@ -485,65 +603,137 @@ elif page == "分析流程":
             else:
                 st.success(f"已应用「{selected_preset}」参数预设。")
 
+    # ── common analysis params (front-placed, read by steps 3 & 4) ──────
+
+    st.markdown("#### 常用分析参数")
+    pcol1, pcol2, pcol3, pcol4, pcol5 = st.columns(5)
+    with pcol1:
+        ensure_widget_key(st.session_state, "_wf_s3_minsize")
+        minsize = st.number_input("min_size (bp)", key="_wf_s3_minsize")
+    with pcol2:
+        ensure_widget_key(st.session_state, "_wf_s3_maxsize")
+        maxsize = st.number_input("max_size (bp)", key="_wf_s3_maxsize")
+    with pcol3:
+        ensure_widget_key(st.session_state, "_wf_s3_mismatch")
+        spec_mismatch = st.number_input("spec mismatch", key="_wf_s3_mismatch")
+    with pcol4:
+        ensure_widget_key(st.session_state, "_wf_s4_mismatches")
+        mismatches = st.text_input(
+            "obipcr mismatches",
+            key="_wf_s4_mismatches",
+            help="Comma-separated mismatch levels.",
+        )
+    with pcol5:
+        ensure_widget_key(st.session_state, "_wf_s4_circular")
+        circular = st.checkbox("Circular", key="_wf_s4_circular")
+
     st.divider()
 
-    # ── dry-run toggle ────────────────────────────────────────────────
+    # Return captured widget values so callers can pass them to step 3/4
+    # command builders within the same render cycle — canonical keys are
+    # only synced at the bottom of the script.
+    common_params = {
+        "min_size": int(minsize) if minsize is not None else 80,
+        "max_size": int(maxsize) if maxsize is not None else 500,
+        "spec_mismatch": int(spec_mismatch) if spec_mismatch is not None else 2,
+        "obipcr_mismatches": str(mismatches),
+        "circular": bool(circular),
+    }
 
+    # Dry-run toggle
     ensure_widget_key(st.session_state, "_workflow_dry_run")
     dry_run = st.toggle(
         "仅预览命令，不执行",
         key="_workflow_dry_run",
         help="启用后命令仅预览，不会实际执行。",
     )
-
     if dry_run:
         st.info("🔍 **仅预览命令模式** — 命令将显示但不会实际执行。")
 
     st.caption("建议首次运行时先开启「仅预览命令」以检查参数。")
 
+    return common_params
+
+
+# ── workflow status row ──────────────────────────────────────────────────────
+
+
+def _render_workflow_status_row() -> None:
+    """Five compact status cards above the workflow tabs."""
+    steps: list[tuple[str, str]] = [
+        ("1. 基础质控", "wf_s1_result"),
+        ("2. 质控汇总", "wf_s2_result"),
+        ("3. 特异性分析", "wf_s3_result"),
+        ("4. obipcr", "wf_s4_result"),
+        ("5. 最终报告", "wf_s5_result"),
+    ]
+
     st.divider()
-
-    # ── helper: render a step result ──────────────────────────────────
-
-    def _render_step_result(run_result: dict | None) -> None:
-        """Display the result of a command execution."""
-        if run_result is None:
-            return
-
-        status = run_result["status"]
-        status_cn = translate_status(status)
-        if status == "PASS":
-            st.success(f"运行成功 — {status_cn}")
-        elif status == "TIMEOUT":
-            st.error(f"运行超时 — {status_cn}: {run_result['message']}")
+    st.subheader("分析流程")
+    cols = st.columns(5)
+    for i, (label, state_key) in enumerate(steps):
+        result = st.session_state.get(state_key)
+        if result is None:
+            icon = "⬜"
+            cn_status = "未运行"
+        elif result.get("status") == "PASS":
+            icon = "✅"
+            cn_status = "成功"
+        elif result.get("status") == "TIMEOUT":
+            icon = "⏱️"
+            cn_status = "超时"
         else:
-            st.error(f"运行失败 — {status_cn}: {run_result['message']}")
+            icon = "❌"
+            cn_status = "失败"
+        with cols[i]:
+            st.markdown(f"{icon} **{label}**")
+            st.caption(cn_status)
 
-        if run_result.get("returncode") is not None:
-            st.metric("返回码", run_result["returncode"])
 
-        with st.expander("查看运行输出"):
-            stdout_text = run_result.get("stdout", "")
-            st.text_area(
-                "stdout",
-                value=stdout_text if stdout_text else "(empty)",
-                height=200,
-                key=f"stdout_{id(run_result)}",
-            )
+# ── step result helper ───────────────────────────────────────────────────────
 
-        stderr_text = run_result.get("stderr", "")
-        if stderr_text:
-            with st.expander("查看错误信息"):
-                st.text_area(
-                    "stderr",
-                    value=stderr_text,
-                    height=200,
-                    key=f"stderr_{id(run_result)}",
-                )
 
-    # ── Step 1: MFEprimer QC ──────────────────────────────────────────
+def _render_step_result(run_result: dict | None, step_key: str) -> None:
+    """Display the result of a command execution.
 
-    st.subheader("步骤 1：MFEprimer 引物基础质控")
+    Uses ``st.code`` (stateless, no widget key) inside expanders so
+    that second and subsequent runs immediately show the latest output.
+
+    Args:
+        run_result: Dict returned by :func:`run_gui_command`, or ``None``.
+        step_key: Stable key suffix (e.g. ``"s1"``) used only for the
+            expander label — never as a Streamlit widget key.
+    """
+    if run_result is None:
+        return
+
+    status = run_result["status"]
+    status_cn = translate_status(status)
+    if status == "PASS":
+        st.success(f"运行成功 — {status_cn}")
+    elif status == "TIMEOUT":
+        st.error(f"运行超时 — {status_cn}: {run_result['message']}")
+    else:
+        st.error(f"运行失败 — {status_cn}: {run_result['message']}")
+
+    if run_result.get("returncode") is not None:
+        st.metric("返回码", run_result["returncode"])
+
+    stdout_text = run_result.get("stdout", "")
+    with st.expander("查看运行输出"):
+        st.code(stdout_text if stdout_text else "(empty)", language=None)
+
+    stderr_text = run_result.get("stderr", "")
+    if stderr_text:
+        with st.expander("查看错误信息"):
+            st.code(stderr_text, language=None)
+
+
+# ── workflow tabs ────────────────────────────────────────────────────────────
+
+
+def _render_workflow_step_1() -> None:
+    """Tab: MFEprimer 引物基础质控."""
     st.caption("计算 Tm、GC、二聚体、发卡结构和简并引物展开。")
 
     step1_col1, step1_col2 = st.columns(2)
@@ -552,12 +742,14 @@ elif page == "分析流程":
         s1_primers = st.text_input(
             "引物文件 (primers.tsv)",
             key="_wf_s1_primers",
+            on_change=_make_path_edited_callback("wf_s1_primers"),
         )
     with step1_col2:
         ensure_widget_key(st.session_state, "_wf_s1_outdir")
         s1_outdir = st.text_input(
             "质控输出目录",
             key="_wf_s1_outdir",
+            on_change=_make_path_edited_callback("wf_s1_outdir"),
         )
 
     s1_col_flags, _s1_spacer = st.columns([1, 2])
@@ -605,6 +797,7 @@ elif page == "分析流程":
         )
         st.code(" ".join(s1_cmd), language="bash")
 
+    dry_run = st.session_state.get("workflow_dry_run", False)
     if st.button("运行基础质控", key="wf_run_s1"):
         if dry_run:
             st.info("仅预览模式：命令未实际执行。")
@@ -612,24 +805,24 @@ elif page == "分析流程":
             with st.spinner("正在运行基础质控..."):
                 result = run_gui_command(s1_cmd, timeout=s1_timeout)
                 st.session_state["wf_s1_result"] = result
-    _render_step_result(st.session_state.get("wf_s1_result"))
+    _render_step_result(st.session_state.get("wf_s1_result"), "s1")
 
-    st.divider()
 
-    # ── Step 2: QC Summary ────────────────────────────────────────────
-
-    st.subheader("步骤 2：生成质控汇总")
+def _render_workflow_step_2() -> None:
+    """Tab: 生成质控汇总."""
     st.caption("解析 MFEprimer 原始输出并生成质控汇总表。")
 
     ensure_widget_key(st.session_state, "_wf_s2_qcdir")
     s2_qc_dir = st.text_input(
         "质控结果目录",
         key="_wf_s2_qcdir",
+        on_change=_make_path_edited_callback("wf_s2_qcdir"),
     )
     s2_cmd = build_qc_summary_command(qc_dir=s2_qc_dir)
     with st.expander("查看实际执行命令"):
         st.code(" ".join(s2_cmd), language="bash")
 
+    dry_run = st.session_state.get("workflow_dry_run", False)
     if st.button("生成质控汇总", key="wf_run_s2"):
         if dry_run:
             st.info("仅预览模式：命令未实际执行。")
@@ -637,13 +830,11 @@ elif page == "分析流程":
             with st.spinner("正在生成质控汇总..."):
                 result = run_gui_command(s2_cmd)
                 st.session_state["wf_s2_result"] = result
-    _render_step_result(st.session_state.get("wf_s2_result"))
+    _render_step_result(st.session_state.get("wf_s2_result"), "s2")
 
-    st.divider()
 
-    # ── Step 3: MFEprimer Spec ────────────────────────────────────────
-
-    st.subheader("步骤 3：MFEprimer 特异性分析")
+def _render_workflow_step_3(common_params: dict) -> None:
+    """Tab: MFEprimer 特异性分析."""
     st.caption("建立参考数据库索引并评估引物扩增特异性。")
 
     s3_col1, s3_col2 = st.columns(2)
@@ -652,31 +843,25 @@ elif page == "分析流程":
         s3_primers = st.text_input(
             "引物文件 (primers.tsv)",
             key="_wf_s3_primers",
+            on_change=_make_path_edited_callback("wf_s3_primers"),
         )
         ensure_widget_key(st.session_state, "_wf_s3_database")
         s3_database = st.text_input(
             "参考数据库 (database.fasta)",
             key="_wf_s3_database",
+            on_change=_make_path_edited_callback("wf_s3_database"),
         )
     with s3_col2:
         ensure_widget_key(st.session_state, "_wf_s3_outdir")
         s3_outdir = st.text_input(
             "特异性分析输出目录",
             key="_wf_s3_outdir",
+            on_change=_make_path_edited_callback("wf_s3_outdir"),
         )
 
-    # Common params
-    s3_col_p1, s3_col_p2 = st.columns(2)
-    with s3_col_p1:
-        ensure_widget_key(st.session_state, "_wf_s3_minsize")
-        s3_min_size = st.number_input("min_size", key="_wf_s3_minsize")
-        ensure_widget_key(st.session_state, "_wf_s3_maxsize")
-        s3_max_size = st.number_input("max_size", key="_wf_s3_maxsize")
-    with s3_col_p2:
-        ensure_widget_key(st.session_state, "_wf_s3_mismatch")
-        s3_mismatch = st.number_input("mismatch", key="_wf_s3_mismatch")
-        ensure_widget_key(st.session_state, "_wf_s3_timeout")
-        s3_timeout = st.number_input("timeout (s)", key="_wf_s3_timeout")
+    # Common params — minsize/maxsize/mismatch are front-placed (see _render_preset_controls)
+    ensure_widget_key(st.session_state, "_wf_s3_timeout")
+    s3_timeout = st.number_input("timeout (s)", key="_wf_s3_timeout")
 
     with st.expander("高级参数"):
         as3c1, as3c2 = st.columns(2)
@@ -698,11 +883,11 @@ elif page == "分析流程":
             primers=s3_primers,
             database=s3_database,
             outdir=s3_outdir,
-            min_size=s3_min_size,
-            max_size=s3_max_size,
+            min_size=common_params["min_size"],
+            max_size=common_params["max_size"],
             tm=s3_tm,
             max_tm=s3_max_tm,
-            mismatch=s3_mismatch,
+            mismatch=common_params["spec_mismatch"],
             cpu=s3_cpu,
             kvalue=s3_kvalue,
             timeout=s3_timeout,
@@ -710,6 +895,7 @@ elif page == "分析流程":
         )
         st.code(" ".join(s3_cmd), language="bash")
 
+    dry_run = st.session_state.get("workflow_dry_run", False)
     if st.button("运行特异性分析", key="wf_run_s3"):
         if dry_run:
             st.info("仅预览模式：命令未实际执行。")
@@ -717,13 +903,11 @@ elif page == "分析流程":
             with st.spinner("正在运行特异性分析..."):
                 result = run_gui_command(s3_cmd, timeout=s3_timeout)
                 st.session_state["wf_s3_result"] = result
-    _render_step_result(st.session_state.get("wf_s3_result"))
+    _render_step_result(st.session_state.get("wf_s3_result"), "s3")
 
-    st.divider()
 
-    # ── Step 4: obipcr Run ────────────────────────────────────────────
-
-    st.subheader("步骤 4：obipcr 全库模拟 PCR")
+def _render_workflow_step_4(common_params: dict) -> None:
+    """Tab: obipcr 全库模拟 PCR."""
     st.caption("在参考数据库中批量模拟引物扩增。")
 
     s4_col1, s4_col2 = st.columns(2)
@@ -732,35 +916,32 @@ elif page == "分析流程":
         s4_primers = st.text_input(
             "引物文件 (primers.tsv)",
             key="_wf_s4_primers",
+            on_change=_make_path_edited_callback("wf_s4_primers"),
         )
         ensure_widget_key(st.session_state, "_wf_s4_database")
         s4_database = st.text_input(
             "参考数据库 (normalized FASTA)",
             key="_wf_s4_database",
+            on_change=_make_path_edited_callback("wf_s4_database"),
         )
     with s4_col2:
         ensure_widget_key(st.session_state, "_wf_s4_taxonomy")
         s4_taxonomy = st.text_input(
             "分类信息 (taxonomy.tsv)",
             key="_wf_s4_taxonomy",
+            on_change=_make_path_edited_callback("wf_s4_taxonomy"),
         )
         ensure_widget_key(st.session_state, "_wf_s4_outdir")
         s4_outdir = st.text_input(
             "obipcr 输出目录",
             key="_wf_s4_outdir",
+            on_change=_make_path_edited_callback("wf_s4_outdir"),
         )
 
-    ensure_widget_key(st.session_state, "_wf_s4_mismatches")
-    s4_mismatches = st.text_input(
-        "mismatches",
-        key="_wf_s4_mismatches",
-        help="Comma-separated mismatch levels.",
-    )
+    # mismatches & circular are front-placed (see _render_preset_controls)
 
     s4_flags_col, s4_timeout_col = st.columns([2, 1])
     with s4_flags_col:
-        ensure_widget_key(st.session_state, "_wf_s4_circular")
-        s4_circular = st.checkbox("Circular（环状基因组）", key="_wf_s4_circular")
         ensure_widget_key(st.session_state, "_wf_s4_summarize")
         s4_summarize = st.checkbox("Summarize（汇总统计）", key="_wf_s4_summarize")
         ensure_widget_key(st.session_state, "_wf_s4_report")
@@ -777,8 +958,8 @@ elif page == "分析流程":
             database=s4_database,
             outdir=s4_outdir,
             taxonomy=s4_taxonomy,
-            mismatches=s4_mismatches,
-            circular=s4_circular,
+            mismatches=common_params["obipcr_mismatches"],
+            circular=common_params["circular"],
             summarize=s4_summarize,
             report=s4_report,
             force=s4_force,
@@ -786,6 +967,7 @@ elif page == "分析流程":
         )
         st.code(" ".join(s4_cmd), language="bash")
 
+    dry_run = st.session_state.get("workflow_dry_run", False)
     if st.button("运行全库模拟 PCR", key="wf_run_s4"):
         if dry_run:
             st.info("仅预览模式：命令未实际执行。")
@@ -793,13 +975,11 @@ elif page == "分析流程":
             with st.spinner("正在运行 obipcr 全库模拟 PCR..."):
                 result = run_gui_command(s4_cmd, timeout=s4_timeout)
                 st.session_state["wf_s4_result"] = result
-    _render_step_result(st.session_state.get("wf_s4_result"))
+    _render_step_result(st.session_state.get("wf_s4_result"), "s4")
 
-    st.divider()
 
-    # ── Step 5: Final Report ──────────────────────────────────────────
-
-    st.subheader("步骤 5：生成最终综合报告")
+def _render_workflow_step_5() -> None:
+    """Tab: 生成最终综合报告."""
     st.caption("整合 obipcr、引物质控和特异性分析结果。")
 
     s5_col1, s5_col2 = st.columns(2)
@@ -808,22 +988,26 @@ elif page == "分析流程":
         s5_obipcr_dir = st.text_input(
             "obipcr 结果目录",
             key="_wf_s5_obipcr_dir",
+            on_change=_make_path_edited_callback("wf_s5_obipcr_dir"),
         )
         ensure_widget_key(st.session_state, "_wf_s5_qc_dir")
         s5_qc_dir = st.text_input(
             "质控结果目录",
             key="_wf_s5_qc_dir",
+            on_change=_make_path_edited_callback("wf_s5_qc_dir"),
         )
     with s5_col2:
         ensure_widget_key(st.session_state, "_wf_s5_spec_dir")
         s5_spec_dir = st.text_input(
             "特异性分析结果目录",
             key="_wf_s5_spec_dir",
+            on_change=_make_path_edited_callback("wf_s5_spec_dir"),
         )
         ensure_widget_key(st.session_state, "_wf_s5_outdir")
         s5_outdir = st.text_input(
             "最终报告输出目录",
             key="_wf_s5_outdir",
+            on_change=_make_path_edited_callback("wf_s5_outdir"),
         )
 
     with st.expander("查看实际执行命令"):
@@ -835,6 +1019,7 @@ elif page == "分析流程":
         )
         st.code(" ".join(s5_cmd), language="bash")
 
+    dry_run = st.session_state.get("workflow_dry_run", False)
     if st.button("生成最终报告", key="wf_run_s5"):
         if dry_run:
             st.info("仅预览模式：命令未实际执行。")
@@ -842,7 +1027,52 @@ elif page == "分析流程":
             with st.spinner("正在生成最终综合报告..."):
                 result = run_gui_command(s5_cmd)
                 st.session_state["wf_s5_result"] = result
-    _render_step_result(st.session_state.get("wf_s5_result"))
+    _render_step_result(st.session_state.get("wf_s5_result"), "s5")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Page config
+# ═══════════════════════════════════════════════════════════════════════════
+
+st.set_page_config(
+    page_title="fullpcr 引物评测平台",
+    page_icon="🧬",
+    layout="wide",
+)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Cross-page persistence: canonical defaults
+# ═══════════════════════════════════════════════════════════════════════════
+
+init_canonical_defaults(st.session_state)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Header
+# ═══════════════════════════════════════════════════════════════════════════
+
+_render_header()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Sidebar navigation
+# ═══════════════════════════════════════════════════════════════════════════
+
+st.sidebar.title("🧬 fullpcr")
+
+page = st.sidebar.radio(
+    "导航",
+    ["分析工作台", "结果总览", "报告与下载"],
+    index=0,
+)
+
+st.sidebar.markdown("---")
+st.sidebar.caption("GUI Phase 7A")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Page routing
+# ═══════════════════════════════════════════════════════════════════════════
+
+if page == "分析工作台":
+    _render_analysis_workbench()
 
 elif page == "结果总览":
     st.header("结果总览")
@@ -1108,8 +1338,8 @@ elif page == "结果总览":
     else:
         st.info("点击 **加载分析结果** 查看分析输出。")
 
-elif page == "报告查看":
-    st.header("报告查看")
+elif page == "报告与下载":
+    st.header("报告与下载")
     st.markdown("查看最终综合报告和 obipcr 分析报告。")
 
     # ── file path inputs ──────────────────────────────────────────────
@@ -1188,6 +1418,8 @@ elif page == "报告查看":
     else:
         st.info("点击 **加载报告** 查看生成的报告。")
 
-# ── cross-page persistence: sync widget → canonical ────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# Cross-page persistence: sync widget → canonical
+# ═══════════════════════════════════════════════════════════════════════════
 
 sync_widgets_to_canonical(st.session_state)

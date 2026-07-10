@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import MutableMapping
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as get_package_version
@@ -126,6 +127,77 @@ def translate_warning_label(value: str | None) -> str:
         return "；".join(translated)
 
     return mapping.get(value, value)
+
+
+# ── environment status (Phase 7A) ─────────────────────────────────────────
+
+
+def collect_environment_status() -> dict:
+    """Run all environment checks and return a structured status dict.
+
+    Calls :func:`get_python_info`, :func:`get_fullpcr_info`, and
+    :func:`check_command_available` for obipcr and MFEprimer — each
+    via ``subprocess.run(list[str])`` with no ``shell=True``.
+
+    Returns:
+        dict with keys:
+
+        - ``python``: result of :func:`get_python_info`
+        - ``fullpcr``: result of :func:`get_fullpcr_info`
+        - ``obipcr``: result of ``check_command_available(["obipcr", "--version"])``
+        - ``mfeprimer``: result of ``check_command_available(["mfeprimer", "version"])``
+        - ``cwd``: ``os.getcwd()``
+        - ``ok_count`` (int): number of available tools (0–4)
+        - ``fail_count`` (int): 4 – ok_count
+        - ``all_ok`` (bool): ``True`` when all four tools are available
+        - ``checked_at`` (float): ``time.time()`` when this result was collected
+    """
+    py_info = get_python_info()
+    fp_info = get_fullpcr_info()
+    obi = check_command_available(["obipcr", "--version"])
+    mfe = check_command_available(["mfeprimer", "version"])
+
+    ok_count = sum([
+        1,  # Python is always available
+        1 if fp_info["importable"] else 0,
+        1 if obi["available"] else 0,
+        1 if mfe["available"] else 0,
+    ])
+
+    return {
+        "python": py_info,
+        "fullpcr": fp_info,
+        "obipcr": obi,
+        "mfeprimer": mfe,
+        "cwd": os.getcwd(),
+        "ok_count": ok_count,
+        "fail_count": 4 - ok_count,
+        "all_ok": ok_count == 4,
+        "checked_at": time.time(),
+    }
+
+
+def should_refresh_environment_status(
+    checked_at: float | None,
+    now: float,
+    ttl_seconds: int = 60,
+) -> bool:
+    """Return ``True`` when the environment status should be re-collected.
+
+    Args:
+        checked_at: ``time.time()`` value from the last collection, or
+            ``None`` when no previous collection exists.
+        now: Current ``time.time()`` value.
+        ttl_seconds: Maximum age in seconds before a refresh is needed
+            (default 60).
+
+    Returns:
+        ``True`` when *checked_at* is ``None`` (never collected) or
+        ``now - checked_at > ttl_seconds``.
+    """
+    if checked_at is None:
+        return True
+    return (now - checked_at) > ttl_seconds
 
 
 def check_command_available(command: list[str]) -> dict:
@@ -1281,14 +1353,14 @@ def apply_project_paths_to_state(
             ``taxonomy_path``, and ``spec_index_database``.
         overwrite: When ``False`` (default), only write to **canonical**
             keys (e.g. ``wf_s1_outdir``) that are missing from *state*,
-            whose current value is ``None``, or whose current value is an
-            empty string — existing non-empty user values are always
-            preserved.  Temp widget keys (``_<canonical>``) are **not**
-            touched; they are managed exclusively by
-            :func:`ensure_widget_key` and Streamlit's widget system.
+            ``None``, or an empty string — existing non-empty values are
+            always preserved, even if they match the canonical default.
+            Temp ``_``-prefixed widget keys are **never** written.
             When ``True``, every mapped canonical key **and** its
             corresponding temp widget key are force-synced from *paths*
-            (used by the sync button for immediate UI update).
+            (used by the "从输入文件同步路径" button for immediate UI
+            update).  Only keys in :data:`_WORKFLOW_PATH_MAP` are
+            affected; params and unrelated state are untouched.
     """
     if not paths or not paths.get("output_root"):
         return
@@ -1303,12 +1375,6 @@ def apply_project_paths_to_state(
         else:
             current = state.get(state_key)
             if current is None or current == "":
-                # Write canonical key only — widget keys are managed by
-                # ensure_widget_key() (called right before widget creation)
-                # and Streamlit's widget system.  Writing widget keys here
-                # would set them "behind Streamlit's back", which causes
-                # the framework to reset them to their initial value when
-                # the user navigates away from the page.
                 state[state_key] = value
 
 

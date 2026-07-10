@@ -23,6 +23,7 @@ from fullpcr.gui_helpers import (
     build_qc_spec_command,
     build_qc_summary_command,
     check_command_available,
+    collect_environment_status,
     compute_inputs_validated,
     derive_project_paths,
     ensure_widget_key,
@@ -34,6 +35,7 @@ from fullpcr.gui_helpers import (
     load_primer_rank,
     load_tsv_file,
     run_gui_command,
+    should_refresh_environment_status,
     summarize_primer_rank,
     summarize_status_counts,
     sync_widgets_to_canonical,
@@ -947,7 +949,250 @@ class TestTranslateWarningLabel:
         assert translate_warning_label("NA") == "无数据"
 
 
-# ── Phase 6B: project paths & primer presets tests ──────────────────────
+# ── Phase 7A: environment status tests ───────────────────────────────────
+
+
+class TestCollectEnvironmentStatus:
+    """Tests for collect_environment_status() — all external calls mocked.
+
+    Never executes real obipcr or MFEprimer in unit tests.
+    """
+
+    @staticmethod
+    def _mock_py_info():
+        return {"version": "mock 3.11", "executable": "/mock/python"}
+
+    @staticmethod
+    def _mock_fp_info():
+        return {"importable": True, "version": "0.1.0", "path": "/mock/fullpcr", "error": None}
+
+    @staticmethod
+    def _mock_cmd_ok(_command=None):
+        return {"available": True, "version": "mock-1.0", "error": None}
+
+    @staticmethod
+    def _mock_cmd_fail(_command=None):
+        return {"available": False, "version": None, "error": "mock: not found"}
+
+    def test_returns_all_expected_keys(self):
+        with mock.patch(
+            "fullpcr.gui_helpers.get_python_info", return_value=self._mock_py_info()
+        ), mock.patch(
+            "fullpcr.gui_helpers.get_fullpcr_info", return_value=self._mock_fp_info()
+        ), mock.patch(
+            "fullpcr.gui_helpers.check_command_available", return_value=self._mock_cmd_ok()
+        ), mock.patch("os.getcwd", return_value="/mock/cwd"), mock.patch(
+            "time.time", return_value=1234567890.0
+        ):
+            result = collect_environment_status()
+
+        expected_keys = {
+            "python", "fullpcr", "obipcr", "mfeprimer",
+            "cwd", "ok_count", "fail_count", "all_ok", "checked_at",
+        }
+        assert set(result.keys()) == expected_keys
+
+    def test_checked_at_is_from_mocked_time(self):
+        with mock.patch(
+            "fullpcr.gui_helpers.get_python_info", return_value=self._mock_py_info()
+        ), mock.patch(
+            "fullpcr.gui_helpers.get_fullpcr_info", return_value=self._mock_fp_info()
+        ), mock.patch(
+            "fullpcr.gui_helpers.check_command_available", return_value=self._mock_cmd_ok()
+        ), mock.patch("os.getcwd", return_value="/mock/cwd"), mock.patch(
+            "time.time", return_value=1234567890.0
+        ):
+            result = collect_environment_status()
+
+        assert result["checked_at"] == 1234567890.0
+
+    def test_ok_count_all_available_is_4(self):
+        with mock.patch(
+            "fullpcr.gui_helpers.get_python_info", return_value=self._mock_py_info()
+        ), mock.patch(
+            "fullpcr.gui_helpers.get_fullpcr_info", return_value=self._mock_fp_info()
+        ), mock.patch(
+            "fullpcr.gui_helpers.check_command_available", return_value=self._mock_cmd_ok()
+        ), mock.patch("os.getcwd", return_value="/mock/cwd"), mock.patch(
+            "time.time", return_value=1234567890.0
+        ):
+            result = collect_environment_status()
+
+        assert result["ok_count"] == 4
+        assert result["fail_count"] == 0
+        assert result["all_ok"] is True
+
+    def test_fail_count_when_tools_unavailable(self):
+        def _cmd_varied(cmd):
+            if cmd[0] == "obipcr":
+                return {"available": True, "version": "mock", "error": None}
+            return {"available": False, "version": None, "error": "mock: not found"}
+
+        with mock.patch(
+            "fullpcr.gui_helpers.get_python_info", return_value=self._mock_py_info()
+        ), mock.patch(
+            "fullpcr.gui_helpers.get_fullpcr_info", return_value=self._mock_fp_info()
+        ), mock.patch(
+            "fullpcr.gui_helpers.check_command_available", side_effect=_cmd_varied
+        ), mock.patch("os.getcwd", return_value="/mock/cwd"), mock.patch(
+            "time.time", return_value=1234567890.0
+        ):
+            result = collect_environment_status()
+
+        # Python (always 1) + fullpcr (1) + obipcr (1) = 3, mfeprimer (0) = 1 fail
+        assert result["ok_count"] == 3
+        assert result["fail_count"] == 1
+        assert result["all_ok"] is False
+
+    def test_cwd_is_mocked(self):
+        with mock.patch(
+            "fullpcr.gui_helpers.get_python_info", return_value=self._mock_py_info()
+        ), mock.patch(
+            "fullpcr.gui_helpers.get_fullpcr_info", return_value=self._mock_fp_info()
+        ), mock.patch(
+            "fullpcr.gui_helpers.check_command_available", return_value=self._mock_cmd_ok()
+        ), mock.patch("os.getcwd", return_value="/mock/cwd"), mock.patch(
+            "time.time", return_value=1234567890.0
+        ):
+            result = collect_environment_status()
+
+        assert result["cwd"] == "/mock/cwd"
+
+    def test_python_info_from_mock(self):
+        with mock.patch(
+            "fullpcr.gui_helpers.get_python_info", return_value=self._mock_py_info()
+        ), mock.patch(
+            "fullpcr.gui_helpers.get_fullpcr_info", return_value=self._mock_fp_info()
+        ), mock.patch(
+            "fullpcr.gui_helpers.check_command_available", return_value=self._mock_cmd_ok()
+        ), mock.patch("os.getcwd", return_value="/mock/cwd"), mock.patch(
+            "time.time", return_value=1234567890.0
+        ):
+            result = collect_environment_status()
+
+        assert result["python"]["executable"] == "/mock/python"
+
+    def test_fullpcr_importable_from_mock(self):
+        with mock.patch(
+            "fullpcr.gui_helpers.get_python_info", return_value=self._mock_py_info()
+        ), mock.patch(
+            "fullpcr.gui_helpers.get_fullpcr_info", return_value=self._mock_fp_info()
+        ), mock.patch(
+            "fullpcr.gui_helpers.check_command_available", return_value=self._mock_cmd_ok()
+        ), mock.patch("os.getcwd", return_value="/mock/cwd"), mock.patch(
+            "time.time", return_value=1234567890.0
+        ):
+            result = collect_environment_status()
+
+        assert result["fullpcr"]["importable"] is True
+        assert result["fullpcr"]["version"] == "0.1.0"
+
+
+class TestShouldRefreshEnvironmentStatus:
+    """Tests for should_refresh_environment_status()."""
+
+    def test_none_checked_at_returns_true(self):
+        """Returns True when checked_at is None (never collected)."""
+        assert should_refresh_environment_status(None, 100.0) is True
+
+    def test_within_ttl_returns_false(self):
+        """Returns False when checked_at is within TTL."""
+        assert should_refresh_environment_status(90.0, 100.0, ttl_seconds=60) is False
+
+    def test_exceeded_ttl_returns_true(self):
+        """Returns True when checked_at is older than TTL."""
+        assert should_refresh_environment_status(39.0, 100.0, ttl_seconds=60) is True
+
+    def test_exact_ttl_boundary_returns_false(self):
+        """Returns False at exact TTL boundary (60.0 > 60 is False)."""
+        # 100.0 - 40.0 = 60.0, which is NOT > 60
+        assert should_refresh_environment_status(40.0, 100.0, ttl_seconds=60) is False
+
+    def test_default_ttl_is_60(self):
+        """Default TTL is 60 seconds."""
+        assert should_refresh_environment_status(50.0, 100.0) is False  # 50s < 60s
+        assert should_refresh_environment_status(39.0, 100.0) is True   # 61s > 60s
+
+
+class TestEnvironmentStatusCache:
+    """Integration tests for the environment-status caching loop.
+
+    Simulates the cache-check logic used by ``_render_environment_popover``
+    (``should_refresh_environment_status`` + a ``collect_environment_status``
+    call counter).  No real subprocess is ever spawned.
+    """
+
+    def _simulate_loop(
+        self,
+        events: list[tuple[float, bool]],
+        ttl: int = 60,
+    ) -> list[int]:
+        """Simulate the cache loop and return call counts after each step.
+
+        Args:
+            events: List of ``(now, force_refresh)`` tuples.
+            ttl: TTL in seconds.
+
+        Returns:
+            List of cumulative ``collect_environment_status`` call counts
+            after each event.
+        """
+        checked_at: float | None = None
+        call_count = 0
+        counts: list[int] = []
+
+        for now, force_refresh in events:
+            needs = force_refresh or should_refresh_environment_status(
+                checked_at, now, ttl_seconds=ttl
+            )
+            if needs:
+                call_count += 1
+                checked_at = now
+            counts.append(call_count)
+
+        return counts
+
+    def test_first_call_collects_once(self):
+        """First check always triggers a collection → 1 call."""
+        counts = self._simulate_loop([(100.0, False)])
+        assert counts == [1]
+
+    def test_multiple_reruns_within_ttl_stay_one(self):
+        """Multiple checks within TTL do not re-collect."""
+        counts = self._simulate_loop([
+            (100.0, False),  # first → 1
+            (110.0, False),  # 10 s later → still within TTL
+            (150.0, False),  # 50 s later → still within TTL
+            (159.0, False),  # 59 s later → still within TTL
+        ])
+        assert counts == [1, 1, 1, 1]
+
+    def test_manual_refresh_adds_one(self):
+        """Force-refresh triggers a new collection."""
+        counts = self._simulate_loop([
+            (100.0, False),  # first → 1
+            (110.0, True),   # force refresh → 2
+        ])
+        assert counts == [1, 2]
+
+    def test_ttl_expiry_adds_one(self):
+        """After TTL expires, a check triggers re-collection."""
+        counts = self._simulate_loop([
+            (100.0, False),  # first → 1
+            (161.0, False),  # 61 s later → TTL expired → 2
+        ])
+        assert counts == [1, 2]
+
+    def test_full_cycle(self):
+        """First(1) → TTL内(1) → force(2) → TTL到期(3)."""
+        counts = self._simulate_loop([
+            (100.0, False),  # 1
+            (130.0, False),  # 1 (TTL内)
+            (140.0, True),   # 2 (force)
+            (141.0, False),  # 2 (TTL内 after force)
+            (202.0, False),  # 3 (TTL到期 after last collection at 140)
+        ])
+        assert counts == [1, 1, 2, 2, 3]
 
 
 class TestDeriveProjectPaths:
@@ -1278,34 +1523,45 @@ class TestApplyProjectPathsToStateOverwrite:
         assert state["my_app_key"] == "important"
         assert state["another_flag"] is True
 
-    # ── overwrite=False strict semantics: no fallback comparison ────────
+    # ── overwrite=False strict semantics ─────────────────────────────────
 
-    def test_overwrite_false_preserves_non_empty_even_if_fallback(self):
-        """overwrite=False preserves non-empty values regardless of content."""
+    def test_overwrite_false_preserves_non_empty_even_if_matches_default(self):
+        """overwrite=False preserves non-empty values even when equal to canonical default."""
         state: dict = {
-            "wf_s1_outdir": "qc_results",       # non-empty → preserved
-            "wf_s3_outdir": "qc_spec_results",  # non-empty → preserved
-            "wf_s4_outdir": "obipcr_results",    # non-empty → preserved
+            "wf_s1_outdir": "qc_results",       # canonical default but NON-EMPTY → preserved
+            "wf_s3_outdir": "qc_spec_results",  # canonical default but NON-EMPTY → preserved
+            "wf_s4_outdir": "obipcr_results",   # canonical default but NON-EMPTY → preserved
         }
         apply_project_paths_to_state(state, self._sample_paths(), overwrite=False)
-        # Non-empty values are always preserved — no fallback comparison.
         assert state["wf_s1_outdir"] == "qc_results"
         assert state["wf_s3_outdir"] == "qc_spec_results"
         assert state["wf_s4_outdir"] == "obipcr_results"
 
-    def test_overwrite_false_overwrites_empty_string(self):
+    def test_overwrite_false_does_not_write_widget_keys(self):
+        """overwrite=False never writes _-prefixed temp widget keys."""
+        state: dict = {}
+        apply_project_paths_to_state(state, self._sample_paths(), overwrite=False)
+        for _, state_key in [
+            ("qc_results_dir", "wf_s1_outdir"),
+            ("qc_spec_results_dir", "wf_s3_outdir"),
+            ("final_results_dir", "wf_s5_outdir"),
+        ]:
+            wk = f"_{state_key}"
+            assert wk not in state, f"{wk} should not be written by overwrite=False"
+
+    def test_overwrite_false_fills_empty_string(self):
         """overwrite=False fills keys with empty string values."""
         state: dict = {"wf_s1_outdir": ""}
         apply_project_paths_to_state(state, self._sample_paths(), overwrite=False)
         assert state["wf_s1_outdir"] == "/tmp/proj/qc_results"
 
-    def test_overwrite_false_overwrites_none(self):
+    def test_overwrite_false_fills_none(self):
         """overwrite=False fills keys with None values."""
         state: dict = {"wf_s1_outdir": None}
         apply_project_paths_to_state(state, self._sample_paths(), overwrite=False)
         assert state["wf_s1_outdir"] == "/tmp/proj/qc_results"
 
-    def test_overwrite_false_overwrites_missing_key(self):
+    def test_overwrite_false_fills_missing_key(self):
         """overwrite=False fills keys not present in state."""
         state: dict = {}
         apply_project_paths_to_state(state, self._sample_paths(), overwrite=False)
@@ -1379,24 +1635,26 @@ class TestCanonicalPersistence:
         sync_widgets_to_canonical(state)
         assert state["wf_s3_timeout"] == 555  # unchanged — no widget key present
 
-    def test_overwrite_false_preserves_non_empty_even_default_match(self):
-        """overwrite=False: non-empty 'qc_results' is preserved (not treated as fallback)."""
+    def test_overwrite_false_preserves_default_match_non_empty(self):
+        """overwrite=False preserves non-empty values even when equal to default."""
         state: dict = {"wf_s1_outdir": "qc_results"}
         paths = {
             "output_root": "/tmp/proj",
             "qc_results_dir": "/tmp/proj/qc_results",
         }
         apply_project_paths_to_state(state, paths, overwrite=False)
+        # "qc_results" is non-empty — preserved regardless of matching default.
         assert state["wf_s1_outdir"] == "qc_results"
 
-    def test_overwrite_false_preserves_non_empty_even_primers_default(self):
-        """overwrite=False: non-empty 'example_data/primers.tsv' is preserved."""
+    def test_overwrite_false_preserves_primers_default_non_empty(self):
+        """overwrite=False preserves non-empty 'example_data/primers.tsv' even when equal to default."""
         state: dict = {"wf_s3_primers": "example_data/primers.tsv"}
         paths = {
             "output_root": "/tmp/proj",
             "primers_path": "/tmp/proj/p.tsv",
         }
         apply_project_paths_to_state(state, paths, overwrite=False)
+        # Non-empty → preserved.
         assert state["wf_s3_primers"] == "example_data/primers.tsv"
 
 
@@ -1724,10 +1982,13 @@ class TestGuiAppSmoke:
         at = AppTest.from_file(str(app_path))
         at.run(timeout=30)
         assert not at.exception, f"App raised: {at.exception}"
-        assert at.title[0].value == "fullpcr 全库引物评测平台"
+        # Header now uses st.markdown, not st.title.
+        assert any("fullpcr" in m.value for m in at.markdown), (
+            "fullpcr header not found in markdown elements"
+        )
 
-    def test_clean_session_workflow_page_no_exception(self):
-        """Navigating to the Workflow page on a clean session does not crash."""
+    def test_clean_session_workbench_no_exception(self):
+        """Navigating to the 分析工作台 page on a clean session does not crash."""
         pytest.importorskip("streamlit.testing")
         from streamlit.testing.v1 import AppTest
 
@@ -1735,10 +1996,9 @@ class TestGuiAppSmoke:
         at = AppTest.from_file(str(app_path))
         at.run(timeout=30)
         assert not at.exception, f"App raised on initial load: {at.exception}"
-        at.sidebar.radio[0].set_value("分析流程")
-        at.run(timeout=30)
+        # Default page is already 分析工作台.
         assert not at.exception, (
-            f"App raised on Workflow page: {at.exception}"
+            f"App raised on 分析工作台 page: {at.exception}"
         )
 
     def test_no_session_state_warnings_on_initial_load(self):
@@ -1760,10 +2020,25 @@ class TestGuiAppSmoke:
         at = AppTest.from_file(str(app_path))
         at.run(timeout=30)
         assert not at.exception
-        for page in ["输入文件", "分析流程", "结果总览", "报告查看"]:
+        for page in ["分析工作台", "结果总览", "报告与下载"]:
             at.sidebar.radio[0].set_value(page)
             at.run(timeout=30)
             assert not at.exception, f"App raised on page {page}: {at.exception}"
+
+    def test_sidebar_nav_options_exact(self):
+        """Sidebar radio options are exactly the 3 expected pages."""
+        pytest.importorskip("streamlit.testing")
+        from streamlit.testing.v1 import AppTest
+
+        app_path = Path(__file__).resolve().parent.parent / "fullpcr" / "gui_app.py"
+        at = AppTest.from_file(str(app_path))
+        at.run(timeout=30)
+        assert not at.exception
+
+        options = at.sidebar.radio[0].options
+        assert options == ["分析工作台", "结果总览", "报告与下载"], (
+            f"Unexpected sidebar options: {options}"
+        )
 
 
 class TestGuiAppPreset:
@@ -1772,7 +2047,7 @@ class TestGuiAppPreset:
     @staticmethod
     def _navigate_to_workflow(at):
         """Helper: switch to the Workflow page via the sidebar radio."""
-        at.sidebar.radio[0].set_value("分析流程")
+        at.sidebar.radio[0].set_value("分析工作台")
         at.run(timeout=30)
 
     def test_selecting_preset_without_clicking_apply_does_not_change_params(self):
@@ -1892,7 +2167,7 @@ class TestGuiAppPreset:
         assert not at.exception
 
         # First validate inputs to create a project snapshot.
-        at.sidebar.radio[0].set_value("输入文件").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
         at.button("inputs_validate_btn").click().run()
         assert not at.exception
@@ -1910,6 +2185,114 @@ class TestGuiAppPreset:
         assert at.number_input("_wf_s3_timeout").value == 555
 
 
+class TestGuiAppParamsPlumbing:
+    """Params widget return values feed into command previews immediately.
+
+    Checks ``at.code`` blocks for the actual generated CLI commands.
+    """
+
+    @staticmethod
+    def _app_path():
+        return Path(__file__).resolve().parent.parent / "fullpcr" / "gui_app.py"
+
+    @staticmethod
+    def _code_texts(at) -> list[str]:
+        """Extract visible text from all st.code elements."""
+        return [c.value for c in at.code] if hasattr(at, "code") else []
+
+    @staticmethod
+    def _all_code(at) -> str:
+        return "\n".join(TestGuiAppParamsPlumbing._code_texts(at))
+
+    def test_minsize_999_in_qc_spec_command(self):
+        """Changing _wf_s3_minsize to 999 → '--min-size 999' in qc-spec command."""
+        pytest.importorskip("streamlit.testing")
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file(str(self._app_path()))
+        at.run(timeout=30)
+        assert not at.exception
+
+        at.sidebar.radio[0].set_value("分析工作台").run()
+        assert not at.exception
+
+        at.number_input("_wf_s3_minsize").set_value(999).run()
+        assert not at.exception
+
+        all_code = self._all_code(at)
+        assert "--min-size 999" in all_code, (
+            f"Expected '--min-size 999' in code:\n{all_code}"
+        )
+
+    def test_maxsize_888_mismatch_7_in_qc_spec_command(self):
+        """Changing max_size to 888 and mismatch to 7 → both in qc-spec command."""
+        pytest.importorskip("streamlit.testing")
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file(str(self._app_path()))
+        at.run(timeout=30)
+        assert not at.exception
+
+        at.sidebar.radio[0].set_value("分析工作台").run()
+        assert not at.exception
+
+        at.number_input("_wf_s3_maxsize").set_value(888).run()
+        at.number_input("_wf_s3_mismatch").set_value(7).run()
+        assert not at.exception
+
+        all_code = self._all_code(at)
+        assert "--max-size 888" in all_code, (
+            f"Expected '--max-size 888' in code:\n{all_code}"
+        )
+        assert "--mismatch 7" in all_code, (
+            f"Expected '--mismatch 7' in code:\n{all_code}"
+        )
+
+    def test_obipcr_mismatches_and_circular_in_run_command(self):
+        """mismatches='0,1,2,3,4,5', circular=False → in obipcr run command."""
+        pytest.importorskip("streamlit.testing")
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file(str(self._app_path()))
+        at.run(timeout=30)
+        assert not at.exception
+
+        at.sidebar.radio[0].set_value("分析工作台").run()
+        assert not at.exception
+
+        at.text_input("_wf_s4_mismatches").set_value("0,1,2,3,4,5").run()
+        at.checkbox("_wf_s4_circular").uncheck().run()
+        assert not at.exception
+
+        all_code = self._all_code(at)
+        assert "--mismatches 0,1,2,3,4,5" in all_code, (
+            f"Expected '--mismatches 0,1,2,3,4,5' in code:\n{all_code}"
+        )
+        assert "--circular" not in all_code, (
+            f"Expected no '--circular' in code:\n{all_code}"
+        )
+
+    def test_empty_mismatches_omits_flag(self):
+        """Empty mismatches → '--mismatches' must NOT appear in run command."""
+        pytest.importorskip("streamlit.testing")
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file(str(self._app_path()))
+        at.run(timeout=30)
+        assert not at.exception
+
+        at.sidebar.radio[0].set_value("分析工作台").run()
+        assert not at.exception
+
+        at.text_input("_wf_s4_mismatches").set_value("").run()
+        assert not at.exception
+
+        all_code = self._all_code(at)
+        assert "--mismatches" not in all_code, (
+            f"Expected no '--mismatches' when empty, got:\n{all_code}"
+        )
+
+
 class TestGuiAppPersistence:
     """Integration tests for cross-page widget persistence using AppTest."""
 
@@ -1922,7 +2305,7 @@ class TestGuiAppPersistence:
         at.text_input("_inputs_output_dir").set_value("/user/output").run()
 
     def test_inputs_paths_survive_page_switch(self):
-        """Inputs page paths persist after visiting another page and returning."""
+        """Inputs page paths persist after 分析工作台 → 结果总览 → 分析工作台."""
         pytest.importorskip("streamlit.testing")
         from streamlit.testing.v1 import AppTest
 
@@ -1931,15 +2314,15 @@ class TestGuiAppPersistence:
         at.run(timeout=30)
         assert not at.exception
 
-        # Navigate to Inputs page first, then set custom values.
-        at.sidebar.radio[0].set_value("输入文件").run()
+        # Set custom input paths on 分析工作台.
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
         self._set_inputs_values(at)
 
-        # Navigate away and back.
-        at.sidebar.radio[0].set_value("分析流程").run()
+        # Navigate to 结果总览 and back.
+        at.sidebar.radio[0].set_value("结果总览").run()
         assert not at.exception
-        at.sidebar.radio[0].set_value("输入文件").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
 
         # Values must be preserved, not reset to example_data defaults.
@@ -1966,7 +2349,7 @@ class TestGuiAppPersistence:
         assert not at.exception
 
         # Navigate away and back.
-        at.sidebar.radio[0].set_value("报告查看").run()
+        at.sidebar.radio[0].set_value("报告与下载").run()
         assert not at.exception
         at.sidebar.radio[0].set_value("结果总览").run()
         assert not at.exception
@@ -1984,14 +2367,14 @@ class TestGuiAppPersistence:
         at.run(timeout=30)
         assert not at.exception
 
-        at.sidebar.radio[0].set_value("报告查看").run()
+        at.sidebar.radio[0].set_value("报告与下载").run()
         assert not at.exception
         at.text_input("_rpt_final_path").set_value("/user/report.md").run()
         assert not at.exception
 
         at.sidebar.radio[0].set_value("结果总览").run()
         assert not at.exception
-        at.sidebar.radio[0].set_value("报告查看").run()
+        at.sidebar.radio[0].set_value("报告与下载").run()
         assert not at.exception
 
         assert at.text_input("_rpt_final_path").value == "/user/report.md"
@@ -2007,30 +2390,30 @@ class TestGuiAppPersistence:
         assert not at.exception
 
         # Validate inputs.
-        at.sidebar.radio[0].set_value("输入文件").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
         at.button("inputs_validate_btn").click().run()
         assert not at.exception
 
         # Navigate to Workflow, set manual path.
-        at.sidebar.radio[0].set_value("分析流程").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
         at.text_input("_wf_s1_outdir").set_value("/custom/manual/qc").run()
         assert not at.exception
 
         # Return to Inputs, re-validate.
-        at.sidebar.radio[0].set_value("输入文件").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
         at.button("inputs_validate_btn").click().run()
         assert not at.exception
 
         # Return to Workflow — manual path must survive.
-        at.sidebar.radio[0].set_value("分析流程").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
         assert at.text_input("_wf_s1_outdir").value == "/custom/manual/qc"
 
     def test_preset_select_survives_page_switch(self):
-        """Preset selectbox value persists across page switches."""
+        """Preset selectbox value persists across 分析工作台 → 报告与下载 → 分析工作台."""
         pytest.importorskip("streamlit.testing")
         from streamlit.testing.v1 import AppTest
 
@@ -2039,14 +2422,15 @@ class TestGuiAppPersistence:
         at.run(timeout=30)
         assert not at.exception
 
-        at.sidebar.radio[0].set_value("分析流程").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
         at.selectbox("_wf_preset_select").select("Cytb").run()
         assert not at.exception
 
-        at.sidebar.radio[0].set_value("输入文件").run()
+        # Cross-page: 分析工作台 → 报告与下载 → 分析工作台
+        at.sidebar.radio[0].set_value("报告与下载").run()
         assert not at.exception
-        at.sidebar.radio[0].set_value("分析流程").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
 
         assert at.selectbox("_wf_preset_select").value == "Cytb"
@@ -2062,13 +2446,13 @@ class TestGuiAppPersistence:
         assert not at.exception
 
         # 1. Validate inputs.
-        at.sidebar.radio[0].set_value("输入文件").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
         at.button("inputs_validate_btn").click().run()
         assert not at.exception
 
         # 2. Navigate to Workflow, change paths to non-default values.
-        at.sidebar.radio[0].set_value("分析流程").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
         at.text_input("_wf_s1_outdir").set_value("/custom/manual/qc").run()
         assert not at.exception
@@ -2078,14 +2462,14 @@ class TestGuiAppPersistence:
         assert not at.exception
 
         # 3. Return to Inputs, re-validate.
-        at.sidebar.radio[0].set_value("输入文件").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
         at.button("inputs_validate_btn").click().run()
         # Must NOT raise StreamlitAPIException on re-validation.
         assert not at.exception, f"Re-validation raised: {at.exception}"
 
         # 4. Return to Workflow — manual paths must survive.
-        at.sidebar.radio[0].set_value("分析流程").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
         assert at.text_input("_wf_s1_outdir").value == "/custom/manual/qc"
         assert at.text_input("_wf_s4_outdir").value == "/custom/obipcr"
@@ -2101,7 +2485,7 @@ class TestGuiAppPersistence:
         at.run(timeout=30)
         assert not at.exception
 
-        at.sidebar.radio[0].set_value("输入文件").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
         # Change to custom.
         at.text_input("_inputs_primers_path").set_value("/user/input.tsv").run()
@@ -2122,7 +2506,7 @@ class TestGuiAppPersistence:
         at.run(timeout=30)
         assert not at.exception
 
-        at.sidebar.radio[0].set_value("分析流程").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
         # Change to 999.
         at.number_input("_wf_s3_timeout").set_value(999).run()
@@ -2143,7 +2527,7 @@ class TestGuiAppPersistence:
         at.run(timeout=30)
         assert not at.exception
 
-        at.sidebar.radio[0].set_value("分析流程").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
         # Change to custom.
         at.text_input("_wf_s1_outdir").set_value("/manual/qc").run()
@@ -2184,7 +2568,7 @@ class TestGuiAppPersistence:
         at.run(timeout=30)
         assert not at.exception
 
-        at.sidebar.radio[0].set_value("报告查看").run()
+        at.sidebar.radio[0].set_value("报告与下载").run()
         assert not at.exception
         # Change to custom.
         at.text_input("_rpt_final_path").set_value("/custom/final/report.md").run()
@@ -2204,7 +2588,7 @@ class TestGuiAppPersistence:
         at.run(timeout=30)
         assert not at.exception
 
-        at.sidebar.radio[0].set_value("分析流程").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
         # Set custom values first.
         at.number_input("_wf_s3_minsize").set_value(999).run()
@@ -2228,7 +2612,7 @@ class TestGuiAppPersistence:
         assert not at.exception
 
         # Navigate to Inputs with default (valid) paths first.
-        at.sidebar.radio[0].set_value("输入文件").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
         # Change primers_path to a non-existent file (should FAIL validation).
         at.text_input("_inputs_primers_path").set_value("/nonexistent/path.tsv").run()
@@ -2237,10 +2621,81 @@ class TestGuiAppPersistence:
         assert not at.exception
 
         # Navigate to Workflow — sync button should show warning.
-        at.sidebar.radio[0].set_value("分析流程").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
         at.button("wf_sync_btn").click().run()
         assert not at.exception
+
+    def test_comprehensive_cross_page_persistence(self):
+        """分析工作台 → 结果总览 → 分析工作台: all critical state survives."""
+        pytest.importorskip("streamlit.testing")
+        from streamlit.testing.v1 import AppTest
+
+        app_path = Path(__file__).resolve().parent.parent / "fullpcr" / "gui_app.py"
+        at = AppTest.from_file(str(app_path))
+        at.run(timeout=30)
+        assert not at.exception
+
+        # -- Setup on 分析工作台 --
+        at.sidebar.radio[0].set_value("分析工作台").run()
+        assert not at.exception
+
+        # Validate first with default (valid) paths to create project snapshot.
+        at.button("inputs_validate_btn").click().run()
+        assert not at.exception
+
+        # Now customize inputs paths, workflow path, params.
+        self._set_inputs_values(at)
+        at.text_input("_wf_s1_outdir").set_value("/custom/manual/qc").run()
+        assert not at.exception
+        at.toggle("_workflow_dry_run").set_value(True).run()
+        assert not at.exception
+        at.selectbox("_wf_preset_select").select("COI Folmer").run()
+        assert not at.exception
+        at.button("wf_apply_preset_btn").click().run()
+        assert not at.exception
+        # Inject step result
+        at.session_state["wf_s1_result"] = {
+            "status": "PASS", "stdout": "done", "stderr": "",
+            "returncode": 0, "message": "ok",
+        }
+        at.run(timeout=30)
+        assert not at.exception
+
+        # -- Navigate away to 结果总览 --
+        at.sidebar.radio[0].set_value("结果总览").run()
+        assert not at.exception
+
+        # -- Return to 分析工作台 --
+        at.sidebar.radio[0].set_value("分析工作台").run()
+        assert not at.exception
+
+        # Verify inputs paths
+        assert at.text_input("_inputs_primers_path").value == "/user/input.tsv"
+        assert at.text_input("_inputs_database_path").value == "/user/db.fasta"
+        assert at.text_input("_inputs_taxonomy_path").value == "/user/tax.tsv"
+        assert at.text_input("_inputs_output_dir").value == "/user/output"
+
+        # Verify workflow manual path
+        assert at.text_input("_wf_s1_outdir").value == "/custom/manual/qc"
+
+        # Verify dry-run
+        assert at.toggle("_workflow_dry_run").value is True
+        assert at.session_state["workflow_dry_run"] is True
+
+        # Verify preset + params
+        assert at.selectbox("_wf_preset_select").value == "COI Folmer"
+        assert at.number_input("_wf_s3_minsize").value == 500
+
+        # Verify validation snapshot still present (from first validate)
+        snapshot = at.session_state["input_validation_snapshot"]
+        assert snapshot is not None
+        assert snapshot["all_valid"] is True
+
+        # Verify step result
+        s1 = at.session_state["wf_s1_result"]
+        assert s1 is not None
+        assert s1["stdout"] == "done"
 
 
 # ── Phase 6B (final): Inputs-first path init, Workflow-first preservation,
@@ -2264,7 +2719,7 @@ class TestInputsFirstWorkflowPaths:
         assert not at.exception
 
         # Navigate directly to Inputs (never visited Workflow).
-        at.sidebar.radio[0].set_value("输入文件").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
 
         # Validate with default paths (example_data/* → output_root="results").
@@ -2272,7 +2727,7 @@ class TestInputsFirstWorkflowPaths:
         assert not at.exception
 
         # Navigate to Workflow.
-        at.sidebar.radio[0].set_value("分析流程").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
 
         # UI widget values must show project-derived results/* paths.
@@ -2292,14 +2747,14 @@ class TestInputsFirstWorkflowPaths:
 
 
 class TestWorkflowFirstPreservation:
-    """AppTest: Workflow-first keeps fallbacks until explicit sync."""
+    """AppTest: Phase 7A — merged pages overwrite fallbacks on validation."""
 
     @staticmethod
     def _app_path():
         return Path(__file__).resolve().parent.parent / "fullpcr" / "gui_app.py"
 
-    def test_workflow_first_preserves_non_empty_fallback_until_sync(self):
-        """Flow B: Workflow first → fallback 'qc_results' survives re-validation."""
+    def test_validation_overwrites_fallback_with_project_paths(self):
+        """Phase 7A: on merged page, validation fills project paths over fallbacks."""
         pytest.importorskip("streamlit.testing")
         from streamlit.testing.v1 import AppTest
 
@@ -2307,30 +2762,120 @@ class TestWorkflowFirstPreservation:
         at.run(timeout=30)
         assert not at.exception
 
-        # 1. Open Workflow first — widget gets fallback from _CANONICAL_DEFAULTS.
-        at.sidebar.radio[0].set_value("分析流程").run()
-        assert not at.exception
+        # 1. On merged page, widget gets fallback from _CANONICAL_DEFAULTS.
         assert at.text_input("_wf_s1_outdir").value == "qc_results"
 
-        # 2. Navigate to Inputs and validate.
-        at.sidebar.radio[0].set_value("输入文件").run()
-        assert not at.exception
+        # 2. Validate inputs — project paths overwrite fallback values.
         at.button("inputs_validate_btn").click().run()
         assert not at.exception
-
-        # 3. Return to Workflow — non-empty fallback preserved (overwrite=False).
-        at.sidebar.radio[0].set_value("分析流程").run()
-        assert not at.exception
-        assert at.text_input("_wf_s1_outdir").value == "qc_results"
-
-        # 4. Click sync — now paths are force-overwritten with results/*.
-        at.button("wf_sync_btn").click().run()
-        assert not at.exception
+        # After validation, project-derived path replaces canonical-default fallback.
         assert at.text_input("_wf_s1_outdir").value == "results/qc_results"
 
         # Non-path params remain unchanged.
         assert at.checkbox("_wf_s1_thermo").value is True
         assert at.number_input("_wf_s1_timeout").value == 60
+
+
+class TestEmptyWorkflowPathInit:
+    """AppTest: empty/None workflow paths are filled on validation."""
+
+    @staticmethod
+    def _app_path():
+        return Path(__file__).resolve().parent.parent / "fullpcr" / "gui_app.py"
+
+    def test_first_validate_fills_cleared_path(self):
+        """First validation fills wf_s1_outdir when cleared to empty before click."""
+        pytest.importorskip("streamlit.testing")
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file(str(self._app_path()))
+        at.run(timeout=30)
+        assert not at.exception
+
+        # Navigate to 分析工作台, clear wf_s1_outdir to empty string.
+        at.sidebar.radio[0].set_value("分析工作台").run()
+        assert not at.exception
+        at.text_input("_wf_s1_outdir").set_value("").run()
+        assert not at.exception
+
+        # Validate — first init should fill the empty path.
+        at.button("inputs_validate_btn").click().run()
+        assert not at.exception
+        assert at.text_input("_wf_s1_outdir").value == "results/qc_results"
+
+    def test_second_validate_fills_path_cleared_after_first_init(self):
+        """After first init, clear a path → second validation fills it again."""
+        pytest.importorskip("streamlit.testing")
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file(str(self._app_path()))
+        at.run(timeout=30)
+        assert not at.exception
+
+        at.sidebar.radio[0].set_value("分析工作台").run()
+        assert not at.exception
+
+        # First validation seeds project paths.
+        at.button("inputs_validate_btn").click().run()
+        assert not at.exception
+        assert at.text_input("_wf_s1_outdir").value == "results/qc_results"
+
+        # Clear wf_s1_outdir.
+        at.text_input("_wf_s1_outdir").set_value("").run()
+        assert not at.exception
+
+        # Second validation fills it again.
+        at.button("inputs_validate_btn").click().run()
+        assert not at.exception
+        assert at.text_input("_wf_s1_outdir").value == "results/qc_results"
+
+    def test_user_edited_default_value_preserved(self):
+        """User sets path to /manual/qc then back to qc_results — preserved after validation."""
+        pytest.importorskip("streamlit.testing")
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file(str(self._app_path()))
+        at.run(timeout=30)
+        assert not at.exception
+
+        at.sidebar.radio[0].set_value("分析工作台").run()
+        assert not at.exception
+
+        # User types custom, then back to default.
+        at.text_input("_wf_s1_outdir").set_value("/manual/qc").run()
+        assert not at.exception
+        at.text_input("_wf_s1_outdir").set_value("qc_results").run()
+        assert not at.exception
+
+        # Validate — "qc_results" is non-empty, user_edited → preserved.
+        at.button("inputs_validate_btn").click().run()
+        assert not at.exception
+        assert at.text_input("_wf_s1_outdir").value == "qc_results"
+
+    def test_non_empty_custom_path_preserved_on_revalidation(self):
+        """Non-empty custom path survives re-validation."""
+        pytest.importorskip("streamlit.testing")
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file(str(self._app_path()))
+        at.run(timeout=30)
+        assert not at.exception
+
+        at.sidebar.radio[0].set_value("分析工作台").run()
+        assert not at.exception
+
+        # First validation.
+        at.button("inputs_validate_btn").click().run()
+        assert not at.exception
+
+        # Set custom non-empty path.
+        at.text_input("_wf_s1_outdir").set_value("/custom/manual/qc").run()
+        assert not at.exception
+
+        # Re-validate.
+        at.button("inputs_validate_btn").click().run()
+        assert not at.exception
+        assert at.text_input("_wf_s1_outdir").value == "/custom/manual/qc"
 
 
 class TestDryRunPersistence:
@@ -2341,7 +2886,7 @@ class TestDryRunPersistence:
         return Path(__file__).resolve().parent.parent / "fullpcr" / "gui_app.py"
 
     def test_dry_run_survives_page_switch(self):
-        """Toggle workflow_dry_run to True, switch pages, verify it persists."""
+        """Toggle workflow_dry_run to True, switch 分析工作台 → 结果总览 → 分析工作台, verify persistence."""
         pytest.importorskip("streamlit.testing")
         from streamlit.testing.v1 import AppTest
 
@@ -2349,18 +2894,108 @@ class TestDryRunPersistence:
         at.run(timeout=30)
         assert not at.exception
 
-        # 1. Navigate to Workflow and enable dry-run.
-        at.sidebar.radio[0].set_value("分析流程").run()
+        # 1. Enable dry-run on 分析工作台.
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
         at.toggle("_workflow_dry_run").set_value(True).run()
         assert not at.exception
 
-        # 2. Switch to Inputs, then back to Workflow.
-        at.sidebar.radio[0].set_value("输入文件").run()
+        # 2. Cross-page: 分析工作台 → 结果总览 → 分析工作台.
+        at.sidebar.radio[0].set_value("结果总览").run()
         assert not at.exception
-        at.sidebar.radio[0].set_value("分析流程").run()
+        at.sidebar.radio[0].set_value("分析工作台").run()
         assert not at.exception
 
         # 3. UI temp key and canonical value must both be True.
         assert at.toggle("_workflow_dry_run").value is True
         assert at.session_state["workflow_dry_run"] is True
+
+
+# ── Phase 7A fix: stdout/stderr stale display regression ──────────────────
+
+
+class TestStepResultDisplay:
+    """Regression tests: second run must immediately show latest stdout/stderr."""
+
+    @staticmethod
+    def _app_path():
+        return Path(__file__).resolve().parent.parent / "fullpcr" / "gui_app.py"
+
+    @staticmethod
+    def _code_texts(at) -> list[str]:
+        """Extract visible text from all st.code elements in the app."""
+        return [c.value for c in at.code] if hasattr(at, "code") else []
+
+    def test_stdout_second_run_shows_new_content(self):
+        """Update wf_s1_result.stdout from FIRST to SECOND — SECOND must appear."""
+        pytest.importorskip("streamlit.testing")
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file(str(self._app_path()))
+        at.run(timeout=30)
+        assert not at.exception
+
+        # Inject result with "FIRST".
+        at.session_state["wf_s1_result"] = {
+            "status": "PASS",
+            "stdout": "FIRST\n",
+            "stderr": "",
+            "returncode": 0,
+            "message": "ok",
+        }
+        at.run(timeout=30)
+        assert not at.exception
+
+        # Update to "SECOND".
+        at.session_state["wf_s1_result"] = {
+            "status": "PASS",
+            "stdout": "SECOND\n",
+            "stderr": "",
+            "returncode": 0,
+            "message": "ok",
+        }
+        at.run(timeout=30)
+        assert not at.exception
+
+        # After second render: SECOND must appear, FIRST must NOT appear.
+        code_texts = self._code_texts(at)
+        all_code = "\n".join(code_texts)
+        assert "SECOND" in all_code, f"SECOND not found in code: {all_code!r}"
+        assert "FIRST" not in all_code, f"FIRST unexpectedly still in code: {all_code!r}"
+
+    def test_stderr_second_run_shows_new_content(self):
+        """Update wf_s1_result.stderr from ERR1 to ERR2 — ERR2 must appear."""
+        pytest.importorskip("streamlit.testing")
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file(str(self._app_path()))
+        at.run(timeout=30)
+        assert not at.exception
+
+        # Inject result with "ERR1" stderr.
+        at.session_state["wf_s1_result"] = {
+            "status": "FAIL",
+            "stdout": "",
+            "stderr": "ERR1: something went wrong\n",
+            "returncode": 1,
+            "message": "failed",
+        }
+        at.run(timeout=30)
+        assert not at.exception
+
+        # Update stderr to "ERR2".
+        at.session_state["wf_s1_result"] = {
+            "status": "FAIL",
+            "stdout": "",
+            "stderr": "ERR2: different error\n",
+            "returncode": 1,
+            "message": "failed",
+        }
+        at.run(timeout=30)
+        assert not at.exception
+
+        # After second render: ERR2 must appear, ERR1 must NOT appear.
+        code_texts = self._code_texts(at)
+        all_code = "\n".join(code_texts)
+        assert "ERR2" in all_code, f"ERR2 not found in code: {all_code!r}"
+        assert "ERR1" not in all_code, f"ERR1 unexpectedly still in code: {all_code!r}"
