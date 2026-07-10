@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import MutableMapping
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as get_package_version
 from pathlib import Path
@@ -999,3 +1000,351 @@ def summarize_status_counts(df: pd.DataFrame, column: str) -> dict:
     result["counts"] = {str(k): int(v) for k, v in counts.items()}
     result["total"] = sum(result["counts"].values())
     return result
+
+
+# ── Phase 6B: project paths & primer presets ───────────────────────────────
+
+
+def derive_project_paths(output_root: str) -> dict:
+    """Derive project sub-directory paths from a root output directory.
+
+    Does **not** create any directories on disk.
+
+    Args:
+        output_root: Root directory path for project outputs.
+
+    Returns:
+        dict with keys ``output_root``, ``qc_results_dir``,
+        ``qc_spec_results_dir``, ``obipcr_results_dir``,
+        ``final_results_dir``.  All values are empty strings when
+        *output_root* is falsy.
+    """
+    if not output_root:
+        return {
+            "output_root": "",
+            "qc_results_dir": "",
+            "qc_spec_results_dir": "",
+            "obipcr_results_dir": "",
+            "final_results_dir": "",
+        }
+    root = Path(output_root)
+    return {
+        "output_root": str(root),
+        "qc_results_dir": str(root / "qc_results"),
+        "qc_spec_results_dir": str(root / "qc_spec_results"),
+        "obipcr_results_dir": str(root / "obipcr_results"),
+        "final_results_dir": str(root / "final_results"),
+    }
+
+
+def compute_inputs_validated(
+    primers_status: str,
+    database_status: str,
+    taxonomy_status: str,
+    output_status: str,
+) -> bool:
+    """Determine whether all four inputs pass validation.
+
+    Returns ``True`` **only** when:
+
+    * *primers_status* is ``"PASS"``
+    * *database_status* is ``"PASS"``
+    * *taxonomy_status* is ``"PASS"``
+    * *output_status* is ``"PASS"`` or ``"WARN"``
+
+    Every ``"FAIL"`` (including taxonomy and output) forces ``False``.
+    """
+    return (
+        primers_status == "PASS"
+        and database_status == "PASS"
+        and taxonomy_status == "PASS"
+        and output_status in ("PASS", "WARN")
+    )
+
+
+def get_primer_preset(name: str) -> dict:
+    """Return parameter defaults for a named primer preset.
+
+    Args:
+        name: One of ``"12S/16S 短片段"``, ``"COI mini-barcode"``,
+            ``"COI Folmer"``, ``"Cytb"``, ``"自定义"``.
+
+    Returns:
+        dict with keys ``description``, ``min_size``, ``max_size``,
+        ``spec_mismatch``, ``obipcr_mismatches``, ``circular``.
+        Unknown names fall back to the ``"自定义"`` preset (all values
+        ``None``).
+    """
+    presets: dict[str, dict] = {
+        "12S/16S 短片段": {
+            "description": "适用于 12S/16S rRNA 短片段扩增；推荐长度 80-500 bp，circular 模式",
+            "min_size": 80,
+            "max_size": 500,
+            "spec_mismatch": 2,
+            "obipcr_mismatches": "0,1,2",
+            "circular": True,
+        },
+        "COI mini-barcode": {
+            "description": "适用于 COI mini-barcode (100-350 bp)；推荐长度 100-350 bp，circular 模式",
+            "min_size": 100,
+            "max_size": 350,
+            "spec_mismatch": 2,
+            "obipcr_mismatches": "0,1,2,3",
+            "circular": True,
+        },
+        "COI Folmer": {
+            "description": "适用于 COI Folmer 区域 (500-800 bp)；推荐长度 500-800 bp，circular 模式",
+            "min_size": 500,
+            "max_size": 800,
+            "spec_mismatch": 3,
+            "obipcr_mismatches": "0,1,2,3",
+            "circular": True,
+        },
+        "Cytb": {
+            "description": "适用于 Cytb 基因片段 (300-1200 bp)；推荐长度 300-1200 bp，circular 模式",
+            "min_size": 300,
+            "max_size": 1200,
+            "spec_mismatch": 3,
+            "obipcr_mismatches": "0,1,2,3",
+            "circular": True,
+        },
+        "自定义": {
+            "description": "不自动修改参数，请根据实验需求手动设置",
+            "min_size": None,
+            "max_size": None,
+            "spec_mismatch": None,
+            "obipcr_mismatches": None,
+            "circular": None,
+        },
+    }
+    return presets.get(name, presets["自定义"])
+
+
+#: Fixed mapping: project-path key → workflow canonical key.
+#: Used by :func:`apply_project_paths_to_state` to keep the two in sync.
+_WORKFLOW_PATH_MAP: list[tuple[str, str]] = [
+    ("primers_path", "wf_s1_primers"),
+    ("qc_results_dir", "wf_s1_outdir"),
+    ("qc_results_dir", "wf_s2_qcdir"),
+    ("primers_path", "wf_s3_primers"),
+    ("database_path", "wf_s3_database"),
+    ("qc_spec_results_dir", "wf_s3_outdir"),
+    ("primers_path", "wf_s4_primers"),
+    ("spec_index_database", "wf_s4_database"),
+    ("taxonomy_path", "wf_s4_taxonomy"),
+    ("obipcr_results_dir", "wf_s4_outdir"),
+    ("obipcr_results_dir", "wf_s5_obipcr_dir"),
+    ("qc_results_dir", "wf_s5_qc_dir"),
+    ("qc_spec_results_dir", "wf_s5_spec_dir"),
+    ("final_results_dir", "wf_s5_outdir"),
+]
+
+#: Set of workflow canonical keys that are path-derived (the second
+#: element of each tuple in :data:`_WORKFLOW_PATH_MAP`).
+#: Excluded from eager initialisation by :func:`init_canonical_defaults`
+#: so that :func:`apply_project_paths_to_state` can fill them on first
+#: Inputs validation.
+_WORKFLOW_PATH_KEYS: set[str] = {state_key for _, state_key in _WORKFLOW_PATH_MAP}
+
+
+#: Canonical defaults for ALL persisted widget state.
+#: Keys are canonical (stable across page switches); widget keys
+#: are derived by prefixing with ``_`` (e.g. ``_wf_s3_timeout``).
+_CANONICAL_DEFAULTS: dict[str, object] = {
+    # Inputs
+    "inputs_primers_path": "example_data/primers.tsv",
+    "inputs_database_path": "example_data/real_mito_small.fasta",
+    "inputs_taxonomy_path": "example_data/taxonomy.tsv",
+    "inputs_output_dir": "results",
+    # Workflow — paths
+    "wf_s1_primers": "example_data/primers.tsv",
+    "wf_s1_outdir": "qc_results",
+    "wf_s2_qcdir": "qc_results",
+    "wf_s3_primers": "example_data/primers.tsv",
+    "wf_s3_database": "example_data/real_mito_small.fasta",
+    "wf_s3_outdir": "qc_spec_results",
+    "wf_s4_primers": "example_data/primers.tsv",
+    "wf_s4_database": "qc_spec_results/index/database.fasta",
+    "wf_s4_taxonomy": "example_data/taxonomy.tsv",
+    "wf_s4_outdir": "obipcr_results",
+    "wf_s5_obipcr_dir": "obipcr_results",
+    "wf_s5_qc_dir": "qc_results",
+    "wf_s5_spec_dir": "qc_spec_results",
+    "wf_s5_outdir": "final_results",
+    # Workflow — params
+    "wf_s1_thermo": True, "wf_s1_dimer": True, "wf_s1_hairpin": True, "wf_s1_degen": True,
+    "wf_s1_score": 5, "wf_s1_dg": -5.0, "wf_s1_tm": 50.0,
+    "wf_s1_mismatch": 2, "wf_s1_maxdeg": 256, "wf_s1_timeout": 60,
+    "wf_s3_minsize": 80, "wf_s3_maxsize": 500, "wf_s3_mismatch": 2,
+    "wf_s3_timeout": 300,
+    "wf_s3_tm": 50.0, "wf_s3_maxtm": 75.0, "wf_s3_cpu": 4,
+    "wf_s3_kvalue": 9, "wf_s3_force": True,
+    "wf_s4_mismatches": "0,1,2", "wf_s4_circular": True,
+    "wf_s4_summarize": True, "wf_s4_report": True,
+    "wf_s4_force": True, "wf_s4_timeout": 300,
+    "wf_preset_select": "自定义",
+    # Results
+    "res_final_dir": "final_results",
+    "res_obipcr_dir": "obipcr_results",
+    "res_qc_dir": "qc_results",
+    "res_spec_dir": "qc_spec_results",
+    # Reports
+    "rpt_final_path": "final_results/final_report.md",
+    "rpt_obipcr_path": "obipcr_results/report.md",
+    # Workflow — dry-run (persisted across page switches)
+    "workflow_dry_run": False,
+}
+
+
+#: Set of ALL canonical keys known to the persistence system.
+#: Built from :data:`_CANONICAL_DEFAULTS` at import time.
+_ALL_CANONICAL_KEYS: set[str] = set(_CANONICAL_DEFAULTS.keys())
+
+
+def _widget_key(canonical_key: str) -> str:
+    """Return the temp widget key for a canonical key (prefix with ``_``)."""
+    return f"_{canonical_key}"
+
+
+def init_canonical_defaults(state: MutableMapping) -> None:
+    """Set canonical defaults for keys not already in *state*.
+
+    Called once at the top of the app script, before any widget is
+    created.  No temp ``_``-prefixed keys are touched.
+
+    Workflow path keys (the 14 keys in :data:`_WORKFLOW_PATH_KEYS`) are
+    deliberately **excluded** from eager initialisation so that
+    :func:`apply_project_paths_to_state` can fill them with
+    project-derived ``results/*`` paths on the first Inputs validation.
+    The fallback values remain in :data:`_CANONICAL_DEFAULTS` for
+    :func:`ensure_widget_key` when a user opens the Workflow page first.
+    """
+    for key, default in _CANONICAL_DEFAULTS.items():
+        if key not in state and key not in _WORKFLOW_PATH_KEYS:
+            state[key] = default
+
+
+def ensure_widget_key(state: MutableMapping, widget_key: str) -> None:
+    """Load widget value from canonical state before widget creation.
+
+    If *widget_key* is already in *state* (e.g. because the widget was
+    created earlier this render cycle), this is a no-op.
+
+    Otherwise, the value is copied from the corresponding canonical key
+    (derived by stripping the leading ``_``).  If the canonical key is
+    also absent, the default from :data:`_CANONICAL_DEFAULTS` is used.
+
+    Args:
+        state: A ``MutableMapping``, typically ``st.session_state``.
+        widget_key: The Streamlit widget key (must start with ``_``).
+    """
+    if widget_key in state:
+        return
+    canonical_key = widget_key[1:]  # remove _ prefix
+    if canonical_key in state:
+        state[widget_key] = state[canonical_key]
+    else:
+        default = _CANONICAL_DEFAULTS.get(canonical_key)
+        if default is not None:
+            state[widget_key] = default
+
+
+def sync_widgets_to_canonical(state: MutableMapping) -> None:
+    """Copy temp widget values back to their canonical keys.
+
+    Called at the bottom of the app script, after all widgets have been
+    rendered.  Only widget keys that currently exist in *state* are
+    synced — keys from other pages (cleaned by Streamlit) are skipped.
+    """
+    for canonical_key in _ALL_CANONICAL_KEYS:
+        wk = _widget_key(canonical_key)
+        if wk in state:
+            state[canonical_key] = state[wk]
+
+
+def apply_project_paths_to_state(
+    state: MutableMapping,
+    paths: dict,
+    *,
+    overwrite: bool = False,
+) -> None:
+    """Update session state with project-derived workflow paths.
+
+    Only touches canonical keys listed in :data:`_WORKFLOW_PATH_MAP`;
+    all other keys in *state* are left unchanged.  Safe to call with an
+    empty *paths* dict or when ``paths["output_root"]`` is falsy (no-op).
+
+    Args:
+        state: A ``MutableMapping``, typically ``st.session_state``.
+        paths: dict returned by :func:`derive_project_paths`, optionally
+            extended with ``primers_path``, ``database_path``,
+            ``taxonomy_path``, and ``spec_index_database``.
+        overwrite: When ``False`` (default), only write to **canonical**
+            keys (e.g. ``wf_s1_outdir``) that are missing from *state*,
+            whose current value is ``None``, or whose current value is an
+            empty string — existing non-empty user values are always
+            preserved.  Temp widget keys (``_<canonical>``) are **not**
+            touched; they are managed exclusively by
+            :func:`ensure_widget_key` and Streamlit's widget system.
+            When ``True``, every mapped canonical key **and** its
+            corresponding temp widget key are force-synced from *paths*
+            (used by the sync button for immediate UI update).
+    """
+    if not paths or not paths.get("output_root"):
+        return
+
+    for path_key, state_key in _WORKFLOW_PATH_MAP:
+        value = paths.get(path_key, "")
+        if not value:
+            continue
+        if overwrite:
+            state[state_key] = value
+            state[_widget_key(state_key)] = value
+        else:
+            current = state.get(state_key)
+            if current is None or current == "":
+                # Write canonical key only — widget keys are managed by
+                # ensure_widget_key() (called right before widget creation)
+                # and Streamlit's widget system.  Writing widget keys here
+                # would set them "behind Streamlit's back", which causes
+                # the framework to reset them to their initial value when
+                # the user navigates away from the page.
+                state[state_key] = value
+
+
+# ── primer preset application ────────────────────────────────────────────
+
+#: The 5 canonical keys that :func:`apply_primer_preset_to_state` is
+#: allowed to touch, and their corresponding preset-parameter names.
+_PRESET_KEY_MAP: list[tuple[str, str]] = [
+    ("wf_s3_minsize", "min_size"),
+    ("wf_s3_maxsize", "max_size"),
+    ("wf_s3_mismatch", "spec_mismatch"),
+    ("wf_s4_mismatches", "obipcr_mismatches"),
+    ("wf_s4_circular", "circular"),
+]
+
+
+def apply_primer_preset_to_state(
+    state: MutableMapping, preset_name: str
+) -> None:
+    """Directly write preset parameter values to the 5 affected keys.
+
+    For ``"自定义"`` this is a **no-op** — no key is touched.
+
+    Updates both canonical keys and temp widget keys so the UI
+    reflects changes immediately.
+
+    Args:
+        state: A ``MutableMapping``, typically ``st.session_state``.
+        preset_name: One of the preset names known to
+            :func:`get_primer_preset`.
+    """
+    if preset_name == "自定义":
+        return
+    preset = get_primer_preset(preset_name)
+    for state_key, preset_key in _PRESET_KEY_MAP:
+        val = preset.get(preset_key)
+        if val is not None:
+            state[state_key] = val
+            state[_widget_key(state_key)] = val
