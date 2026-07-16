@@ -3,6 +3,9 @@ __pycache__/
 .pytest_cache/
 *.pyc
 
+# Web upload and runtime data
+data/
+
 # Results and QC output directories
 results*/
 qc_results*/
@@ -27,6 +30,7 @@ final_results*/
 
 # Egg info (build artifact)
 *.egg-info/
+build/
 
 # Protected: example_data essentials
 !example_data/primers.tsv

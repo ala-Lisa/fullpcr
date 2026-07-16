@@ -189,6 +189,167 @@ class TestBuildSpecCommand:
             )
 
 
+# ── Phase 3D-1: new spec params ──────────────────────────────────────────
+
+
+class TestBuildSpecCommandNewParams:
+    """Tests for the 8 new v4.2.4 spec parameters."""
+
+    # -- numeric params (present) ------------------------------------------
+
+    def test_mis_start_present(self):
+        cfg = build_mfeprimer_spec_command(
+            primer_pairs_tsv="/p.tsv", database_path="/d.fa",
+            out_prefix="/o", mis_start=3,
+        )
+        assert "--misStart" in cfg.command
+        assert "3" in cfg.command
+
+    def test_mis_end_present(self):
+        cfg = build_mfeprimer_spec_command(
+            primer_pairs_tsv="/p.tsv", database_path="/d.fa",
+            out_prefix="/o", mis_end=7,
+        )
+        assert "--misEnd" in cfg.command
+        assert "7" in cfg.command
+
+    def test_mono_present(self):
+        cfg = build_mfeprimer_spec_command(
+            primer_pairs_tsv="/p.tsv", database_path="/d.fa",
+            out_prefix="/o", mono=75.0,
+        )
+        assert "--mono" in cfg.command
+        assert "75.0" in cfg.command
+
+    def test_diva_present(self):
+        cfg = build_mfeprimer_spec_command(
+            primer_pairs_tsv="/p.tsv", database_path="/d.fa",
+            out_prefix="/o", diva=2.0,
+        )
+        assert "--diva" in cfg.command
+        assert "2.0" in cfg.command
+
+    def test_dntp_present(self):
+        cfg = build_mfeprimer_spec_command(
+            primer_pairs_tsv="/p.tsv", database_path="/d.fa",
+            out_prefix="/o", dntp=0.5,
+        )
+        assert "--dntp" in cfg.command
+        assert "0.5" in cfg.command
+
+    def test_oligo_present(self):
+        cfg = build_mfeprimer_spec_command(
+            primer_pairs_tsv="/p.tsv", database_path="/d.fa",
+            out_prefix="/o", oligo=100.0,
+        )
+        assert "--oligo" in cfg.command
+        assert "100.0" in cfg.command
+
+    # -- numeric params (None → absent) ------------------------------------
+
+    def test_mis_start_none_absent(self):
+        cfg = build_mfeprimer_spec_command(
+            primer_pairs_tsv="/p.tsv", database_path="/d.fa",
+            out_prefix="/o", mis_start=None,
+        )
+        assert "--misStart" not in cfg.command
+
+    def test_mis_end_none_absent(self):
+        cfg = build_mfeprimer_spec_command(
+            primer_pairs_tsv="/p.tsv", database_path="/d.fa",
+            out_prefix="/o", mis_end=None,
+        )
+        assert "--misEnd" not in cfg.command
+
+    def test_mono_none_absent(self):
+        cfg = build_mfeprimer_spec_command(
+            primer_pairs_tsv="/p.tsv", database_path="/d.fa",
+            out_prefix="/o", mono=None,
+        )
+        assert "--mono" not in cfg.command
+
+    def test_diva_none_absent(self):
+        cfg = build_mfeprimer_spec_command(
+            primer_pairs_tsv="/p.tsv", database_path="/d.fa",
+            out_prefix="/o", diva=None,
+        )
+        assert "--diva" not in cfg.command
+
+    def test_dntp_none_absent(self):
+        cfg = build_mfeprimer_spec_command(
+            primer_pairs_tsv="/p.tsv", database_path="/d.fa",
+            out_prefix="/o", dntp=None,
+        )
+        assert "--dntp" not in cfg.command
+
+    def test_oligo_none_absent(self):
+        cfg = build_mfeprimer_spec_command(
+            primer_pairs_tsv="/p.tsv", database_path="/d.fa",
+            out_prefix="/o", oligo=None,
+        )
+        assert "--oligo" not in cfg.command
+
+    # -- boolean flags ----------------------------------------------------
+
+    def test_bind_true(self):
+        cfg = build_mfeprimer_spec_command(
+            primer_pairs_tsv="/p.tsv", database_path="/d.fa",
+            out_prefix="/o", bind=True,
+        )
+        assert "-b" in cfg.command
+        assert cfg.command.count("-b") == 1
+
+    def test_bind_false_absent(self):
+        cfg = build_mfeprimer_spec_command(
+            primer_pairs_tsv="/p.tsv", database_path="/d.fa",
+            out_prefix="/o", bind=False,
+        )
+        assert "-b" not in cfg.command
+
+    def test_cut_primer_true(self):
+        cfg = build_mfeprimer_spec_command(
+            primer_pairs_tsv="/p.tsv", database_path="/d.fa",
+            out_prefix="/o", cut_primer=True,
+        )
+        assert "--cutprimer" in cfg.command
+        assert cfg.command.count("--cutprimer") == 1
+
+    def test_cut_primer_false_absent(self):
+        cfg = build_mfeprimer_spec_command(
+            primer_pairs_tsv="/p.tsv", database_path="/d.fa",
+            out_prefix="/o", cut_primer=False,
+        )
+        assert "--cutprimer" not in cfg.command
+
+    # -- default command unchanged -----------------------------------------
+
+    def test_default_command_unchanged(self):
+        """With all new params at defaults, command matches pre-3D-1 output."""
+        cfg = build_mfeprimer_spec_command(
+            primer_pairs_tsv="/p.tsv", database_path="/d.fa",
+            out_prefix="/o",
+        )
+        # New params must not appear when at defaults.
+        for flag in ["--misStart", "--misEnd", "-b", "--cutprimer",
+                      "--mono", "--diva", "--dntp", "--oligo"]:
+            assert flag not in cfg.command, f"{flag} leaked at defaults"
+
+    # -- params are separate list elements ---------------------------------
+
+    def test_flag_and_value_are_separate_elements(self):
+        cfg = build_mfeprimer_spec_command(
+            primer_pairs_tsv="/p.tsv", database_path="/d.fa",
+            out_prefix="/o", mono=75.0, mis_start=3, bind=True,
+        )
+        # "--mono" and "75.0" must be separate list elements.
+        idx = cfg.command.index("--mono")
+        assert cfg.command[idx + 1] == "75.0"
+        idx2 = cfg.command.index("--misStart")
+        assert cfg.command[idx2 + 1] == "3"
+        # "-b" is a standalone flag.
+        assert "-b" in cfg.command
+
+
 # ── write_spec_primer_pairs ─────────────────────────────────────────────
 
 

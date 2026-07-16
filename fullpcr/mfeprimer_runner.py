@@ -635,12 +635,20 @@ def build_mfeprimer_spec_command(
     tm: float = 30.0,
     max_tm: float = 100.0,
     mismatch: int | None = None,
+    mis_start: int | None = None,
+    mis_end: int | None = None,
     cpu: int = 4,
     kvalue: int = 9,
     max_amp_count: int = 10000,
+    bind: bool = False,
+    cut_primer: bool = False,
+    mono: float | None = None,
+    diva: float | None = None,
+    dntp: float | None = None,
+    oligo: float | None = None,
     json_output: bool = False,
 ) -> MFEprimerConfig:
-    """Build an ``mfeprimer spec`` command.
+    """Build an ``mfeprimer spec`` command (v4.2.4 parameter contract).
 
     Args:
         primer_pairs_tsv: Path to primer pairs TSV (name, fp, rp).
@@ -651,9 +659,17 @@ def build_mfeprimer_spec_command(
         tm: Minimum Tm cutoff in °C (``-t``, default 30).
         max_tm: Maximum Tm cutoff in °C (``-T``, default 100).
         mismatch: Max allowed mismatches (``--misMatch``, optional).
+        mis_start: Mismatch start position from 3' end (``--misStart``, optional).
+        mis_end: Mismatch end position from 3' end (``--misEnd``, optional).
         cpu: Number of CPU threads (``-c``, default 4).
         kvalue: k-mer size (``-k``, default 9).
         max_amp_count: Max amplicon threshold (``-M``, default 10000).
+        bind: Print binding sites and patterns (``-b``, default False).
+        cut_primer: Cut primer from amplicons (``--cutprimer``, default False).
+        mono: Monovalent cation concentration in mM (``--mono``, optional).
+        diva: Divalent cation concentration in mM (``--diva``, optional).
+        dntp: dNTP concentration in mM (``--dntp``, optional).
+        oligo: Annealing oligo concentration in nM (``--oligo``, optional).
         json_output: If True, add ``-j`` for JSON output.
 
     Returns:
@@ -696,6 +712,22 @@ def build_mfeprimer_spec_command(
         cmd.extend(["-s", str(min_size)])
     if mismatch is not None:
         cmd.extend(["--misMatch", str(mismatch)])
+    if mis_start is not None:
+        cmd.extend(["--misStart", str(mis_start)])
+    if mis_end is not None:
+        cmd.extend(["--misEnd", str(mis_end)])
+    if bind:
+        cmd.append("-b")
+    if cut_primer:
+        cmd.append("--cutprimer")
+    if mono is not None:
+        cmd.extend(["--mono", str(mono)])
+    if diva is not None:
+        cmd.extend(["--diva", str(diva)])
+    if dntp is not None:
+        cmd.extend(["--dntp", str(dntp)])
+    if oligo is not None:
+        cmd.extend(["--oligo", str(oligo)])
     if json_output:
         cmd.append("-j")
 
@@ -716,9 +748,17 @@ def run_mfeprimer_spec(
     tm: float = 30.0,
     max_tm: float = 100.0,
     mismatch: int | None = None,
+    mis_start: int | None = None,
+    mis_end: int | None = None,
     cpu: int = 4,
     kvalue: int = 9,
     max_amp_count: int = 10000,
+    bind: bool = False,
+    cut_primer: bool = False,
+    mono: float | None = None,
+    diva: float | None = None,
+    dntp: float | None = None,
+    oligo: float | None = None,
     json_output: bool = False,
     resume: bool = False,
     force: bool = False,
@@ -754,9 +794,17 @@ def run_mfeprimer_spec(
         tm=tm,
         max_tm=max_tm,
         mismatch=mismatch,
+        mis_start=mis_start,
+        mis_end=mis_end,
         cpu=cpu,
         kvalue=kvalue,
         max_amp_count=max_amp_count,
+        bind=bind,
+        cut_primer=cut_primer,
+        mono=mono,
+        diva=diva,
+        dntp=dntp,
+        oligo=oligo,
         json_output=json_output,
     )
 

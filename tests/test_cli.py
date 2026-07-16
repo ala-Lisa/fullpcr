@@ -1,6 +1,7 @@
 """Tests for CLI module."""
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -1240,9 +1241,10 @@ class TestGuiSubcommand:
         assert 'pip install -e ".[gui]"' in captured.err
 
     def test_run_gui_launches_streamlit(self):
-        """When streamlit is available, calls subprocess.run with list[str]."""
+        """Default call includes --server.address 127.0.0.1 --server.port 8501."""
         with mock.patch("shutil.which", return_value="/usr/bin/streamlit"):
             with mock.patch("subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 0
                 run_gui()
 
         mock_run.assert_called_once()
@@ -1251,19 +1253,58 @@ class TestGuiSubcommand:
         assert all(isinstance(a, str) for a in cmd_passed)
         assert cmd_passed[0] == "streamlit"
         assert cmd_passed[1] == "run"
-        # shell must not be True
+        assert "--server.address" in cmd_passed
+        assert "127.0.0.1" in cmd_passed
+        assert "--server.port" in cmd_passed
+        assert "8501" in cmd_passed
+        assert cmd_passed[cmd_passed.index("--client.toolbarMode") + 1] == "minimal"
+        assert cmd_passed[cmd_passed.index("--theme.base") + 1] == "light"
+        assert cmd_passed[cmd_passed.index("--theme.primaryColor") + 1] == "#2eae7b"
+        assert cmd_passed[cmd_passed.index("--theme.backgroundColor") + 1] == "#f7f9f5"
+        assert cmd_passed[cmd_passed.index("--theme.secondaryBackgroundColor") + 1] == "#ffffff"
+        assert cmd_passed[cmd_passed.index("--theme.textColor") + 1] == "#102a43"
+        assert mock_run.call_args[1].get("shell", False) is False
+
+    def test_run_gui_lan_params(self):
+        """run_gui(host='0.0.0.0', port=8600) passes correct flags."""
+        with mock.patch("shutil.which", return_value="/usr/bin/streamlit"):
+            with mock.patch("subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 0
+                run_gui(host="0.0.0.0", port=8600)
+
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert isinstance(cmd, list)
+        assert "--server.address" in cmd
+        assert "0.0.0.0" in cmd
+        assert "--server.port" in cmd
+        assert "8600" in cmd
         assert mock_run.call_args[1].get("shell", False) is False
 
     def test_main_gui_dispatches(self, capsys):
-        """``main(["gui"])`` dispatches to run_gui without error."""
+        """``main(["gui", "--host", "0.0.0.0", "--port", "8600"])`` dispatches."""
         with mock.patch("shutil.which", return_value="/usr/bin/streamlit"):
             with mock.patch("subprocess.run") as mock_run:
-                main(["gui"])
+                mock_run.return_value.returncode = 0
+                main(["gui", "--host", "0.0.0.0", "--port", "8600"])
 
         mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert "--server.address" in cmd
+        assert "0.0.0.0" in cmd
+        assert "--server.port" in cmd
+        assert "8600" in cmd
         captured = capsys.readouterr()
-        # Should not write errors
         assert "错误" not in captured.err
+
+    @pytest.mark.parametrize("bad_port", ["0", "-1", "65536", "abc"])
+    def test_gui_invalid_port_rejected(self, bad_port):
+        """Invalid port values are rejected by argparse with exit code 2."""
+        with mock.patch("subprocess.run") as mock_run:
+            with pytest.raises(SystemExit) as exc_info:
+                main(["gui", "--port", bad_port])
+        assert exc_info.value.code == 2
+        mock_run.assert_not_called()
 
     def test_gui_in_help_text(self, capsys):
         """``--help`` should list the gui subcommand."""
@@ -1282,7 +1323,8 @@ class TestGuiSubcommand:
         # The actual file will always exist in the dev environment,
         # so we just verify the function doesn't crash when it exists.
         with mock.patch("shutil.which", return_value="/usr/bin/streamlit"):
-            with mock.patch("subprocess.run"):
+            with mock.patch("subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 0
                 # Should not raise — gui_app.py exists in dev
                 run_gui()
 
@@ -1290,6 +1332,7 @@ class TestGuiSubcommand:
         """Confirm the command passed to subprocess.run is list[str]."""
         with mock.patch("shutil.which", return_value="/usr/bin/streamlit"):
             with mock.patch("subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 0
                 run_gui()
 
         cmd = mock_run.call_args[0][0]
@@ -1298,3 +1341,310 @@ class TestGuiSubcommand:
         assert "shell" not in [a.lower() for a in cmd]
         assert "streamlit" in cmd
         assert "run" in cmd
+        assert "--server.address" in cmd
+        assert "--server.port" in cmd
+
+    # ── Phase 4A: --data-dir ───────────────────────────────────────────
+
+    def test_data_dir_accepted_and_forwarded(self):
+        """``--data-dir`` is parsed and passed to run_gui."""
+        with mock.patch("shutil.which", return_value="/usr/bin/streamlit"):
+            with mock.patch("subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 0
+                with mock.patch("pathlib.Path.mkdir"):
+                    main(["gui", "--data-dir", "/srv/fullpcr/data"])
+
+        mock_run.assert_called_once()
+        env = mock_run.call_args[1]["env"]
+        assert env["FULLPCR_DATA_DIR"] == "/srv/fullpcr/data"
+        assert mock_run.call_args[1].get("shell", False) is False
+
+    def test_data_dir_creates_missing_directory(self, tmp_path):
+        """run_gui creates a missing data_dir including parents."""
+        new_dir = tmp_path / "srv" / "fullpcr" / "data"
+        assert not new_dir.exists()
+
+        with mock.patch("shutil.which", return_value="/usr/bin/streamlit"):
+            with mock.patch("subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 0
+                run_gui(data_dir=str(new_dir))
+
+        assert new_dir.is_dir()
+        mock_run.assert_called_once()
+        env = mock_run.call_args[1]["env"]
+        assert Path(env["FULLPCR_DATA_DIR"]).resolve() == new_dir.resolve()
+
+    def test_data_dir_subprocess_env_has_absolute_path(self, tmp_path):
+        """The FULLPCR_DATA_DIR value in the subprocess env is an absolute path."""
+        rel_dir = tmp_path / "data"
+        with mock.patch("shutil.which", return_value="/usr/bin/streamlit"):
+            with mock.patch("subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 0
+                run_gui(data_dir=str(rel_dir))
+
+        env = mock_run.call_args[1]["env"]
+        resolved = env["FULLPCR_DATA_DIR"]
+        assert Path(resolved).is_absolute()
+        assert str(rel_dir.resolve()) == resolved
+
+    def test_data_dir_overrides_existing_env_var(self, tmp_path):
+        """Explicit --data-dir takes precedence over FULLPCR_DATA_DIR in env."""
+        explicit_dir = tmp_path / "explicit"
+        with mock.patch("shutil.which", return_value="/usr/bin/streamlit"):
+            with mock.patch("subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 0
+                with mock.patch.dict(os.environ, {"FULLPCR_DATA_DIR": "/old/path"}):
+                    run_gui(data_dir=str(explicit_dir))
+
+        env = mock_run.call_args[1]["env"]
+        assert Path(env["FULLPCR_DATA_DIR"]).resolve() == explicit_dir.resolve()
+
+    def test_data_dir_does_not_mutate_global_os_environ(self, tmp_path):
+        """Explicit --data-dir must NOT modify os.environ of the test process."""
+        old_environ = dict(os.environ)
+        old = os.environ.get("FULLPCR_DATA_DIR")
+
+        with mock.patch("shutil.which", return_value="/usr/bin/streamlit"):
+            with mock.patch("subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 0
+                run_gui(data_dir=str(tmp_path / "data"))
+
+        assert os.environ.get("FULLPCR_DATA_DIR") == old
+        for k in os.environ:
+            if k not in old_environ:
+                pytest.fail(f"os.environ leaked key: {k}")
+
+    def test_data_dir_rejects_existing_file(self, tmp_path):
+        """A path that exists but is a file (not dir) produces an error exit."""
+        f = tmp_path / "afile"
+        f.write_text("not a dir")
+        with mock.patch("shutil.which", return_value="/usr/bin/streamlit"):
+            with mock.patch("subprocess.run") as mock_run:
+                with pytest.raises(SystemExit) as exc_info:
+                    run_gui(data_dir=str(f))
+
+        assert exc_info.value.code == 1
+        mock_run.assert_not_called()
+
+    def test_data_dir_none_preserves_existing_behavior(self):
+        """When data_dir is None, subprocess inherits the parent env unchanged."""
+        with mock.patch("shutil.which", return_value="/usr/bin/streamlit"):
+            with mock.patch("subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 0
+                with mock.patch.dict(os.environ, {"FULLPCR_DATA_DIR": "/inherited"}, clear=True):
+                    run_gui()
+
+        env = mock_run.call_args[1]["env"]
+        assert env["FULLPCR_DATA_DIR"] == "/inherited"
+
+    def test_data_dir_help_text(self, capsys):
+        """``python -m fullpcr gui --help`` includes --data-dir."""
+        with pytest.raises(SystemExit):
+            main(["gui", "--help"])
+        captured = capsys.readouterr()
+        assert "--data-dir" in captured.out
+
+    # ── Phase 4C-1: exit-code propagation ──────────────────────────────
+
+    def test_run_gui_zero_exit_returns_normally(self):
+        """returncode 0 → no SystemExit."""
+        with mock.patch("shutil.which", return_value="/usr/bin/streamlit"):
+            with mock.patch("subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 0
+                run_gui()  # must not raise
+
+        mock_run.assert_called_once()
+
+    def test_run_gui_nonzero_exit_propagated(self):
+        """returncode 7 → SystemExit(7)."""
+        with mock.patch("shutil.which", return_value="/usr/bin/streamlit"):
+            with mock.patch("subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 7
+                with pytest.raises(SystemExit) as exc_info:
+                    run_gui()
+
+        assert exc_info.value.code == 7
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert isinstance(cmd, list)
+        assert all(isinstance(a, str) for a in cmd)
+        assert mock_run.call_args[1].get("shell", False) is False
+
+    def test_main_gui_nonzero_exit_propagated(self, tmp_path):
+        """main(['gui', ...]) with returncode 23 → SystemExit(23)."""
+        data_dir = tmp_path / "data"
+        with mock.patch("shutil.which", return_value="/usr/bin/streamlit"):
+            with mock.patch("subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 23
+                with pytest.raises(SystemExit) as exc_info:
+                    main(["gui", "--host", "0.0.0.0", "--port", "8600",
+                          "--data-dir", str(data_dir)])
+
+        assert exc_info.value.code == 23
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert isinstance(cmd, list)
+        assert "--server.address" in cmd
+        assert "0.0.0.0" in cmd
+        assert "--server.port" in cmd
+        assert "8600" in cmd
+        assert mock_run.call_args[1].get("shell", False) is False
+        env = mock_run.call_args[1]["env"]
+        assert env["FULLPCR_DATA_DIR"] == str(data_dir.resolve())
+
+
+# ── Phase 3D-1: qc-spec new parameter forwarding ────────────────────────
+
+
+class TestQcSpecNewParams:
+    """CLI parsing and forwarding of the 8 new qc-spec parameters."""
+
+    def _base_args(self, tmp_path):
+        p = tmp_path / "p.tsv"
+        d = tmp_path / "db.fasta"
+        p.write_text("primer_id\tforward\treverse\tmin_length\tmax_length\n")
+        d.write_text(">r1\nATCG\n")
+        return [
+            "qc-spec",
+            "--primers", str(p),
+            "--database", str(d),
+            "--outdir", str(tmp_path / "out"),
+            "--dry-run",
+        ]
+
+    # -- CLI: unset → None / False ----------------------------------------
+
+    def test_defaults_are_none_or_false(self, tmp_path, capsys):
+        with mock.patch("shutil.which", return_value=None):
+            with mock.patch("subprocess.run"), mock.patch("pathlib.Path.mkdir"):
+                main(self._base_args(tmp_path))
+        out = capsys.readouterr().out
+        for flag in ["--misStart", "--misEnd", "--mono", "--diva",
+                      "--dntp", "--oligo", "-b", "--cutprimer"]:
+            assert flag not in out, f"{flag} appeared in dry-run with defaults"
+
+    # -- CLI: explicit values ---------------------------------------------
+
+    def test_mis_start_forwarded(self, tmp_path, capsys):
+        with mock.patch("shutil.which", return_value=None):
+            with mock.patch("subprocess.run"), mock.patch("pathlib.Path.mkdir"):
+                main(self._base_args(tmp_path) + ["--mis-start", "5"])
+        out = capsys.readouterr().out
+        assert "--misStart 5" in out
+
+    def test_mis_end_forwarded(self, tmp_path, capsys):
+        with mock.patch("shutil.which", return_value=None):
+            with mock.patch("subprocess.run"), mock.patch("pathlib.Path.mkdir"):
+                main(self._base_args(tmp_path) + ["--mis-end", "6"])
+        out = capsys.readouterr().out
+        assert "--misEnd 6" in out
+
+    def test_bind_forwarded(self, tmp_path, capsys):
+        with mock.patch("shutil.which", return_value=None):
+            with mock.patch("subprocess.run"), mock.patch("pathlib.Path.mkdir"):
+                main(self._base_args(tmp_path) + ["-b"])
+        out = capsys.readouterr().out
+        spec_line = [l for l in out.splitlines() if "运行 spec" in l][0]
+        assert "-b" in spec_line
+
+    def test_cut_primer_forwarded(self, tmp_path, capsys):
+        with mock.patch("shutil.which", return_value=None):
+            with mock.patch("subprocess.run"), mock.patch("pathlib.Path.mkdir"):
+                main(self._base_args(tmp_path) + ["--cut-primer"])
+        out = capsys.readouterr().out
+        assert "--cutprimer" in out
+
+    def test_mono_forwarded(self, tmp_path, capsys):
+        with mock.patch("shutil.which", return_value=None):
+            with mock.patch("subprocess.run"), mock.patch("pathlib.Path.mkdir"):
+                main(self._base_args(tmp_path) + ["--mono", "75.0"])
+        out = capsys.readouterr().out
+        assert "--mono 75.0" in out
+
+    def test_diva_forwarded(self, tmp_path, capsys):
+        with mock.patch("shutil.which", return_value=None):
+            with mock.patch("subprocess.run"), mock.patch("pathlib.Path.mkdir"):
+                main(self._base_args(tmp_path) + ["--diva", "2.5"])
+        out = capsys.readouterr().out
+        assert "--diva 2.5" in out
+
+    def test_dntp_forwarded(self, tmp_path, capsys):
+        with mock.patch("shutil.which", return_value=None):
+            with mock.patch("subprocess.run"), mock.patch("pathlib.Path.mkdir"):
+                main(self._base_args(tmp_path) + ["--dntp", "0.5"])
+        out = capsys.readouterr().out
+        assert "--dntp 0.5" in out
+
+    def test_oligo_forwarded(self, tmp_path, capsys):
+        with mock.patch("shutil.which", return_value=None):
+            with mock.patch("subprocess.run"), mock.patch("pathlib.Path.mkdir"):
+                main(self._base_args(tmp_path) + ["--oligo", "100.0"])
+        out = capsys.readouterr().out
+        assert "--oligo 100.0" in out
+
+    # -- dry-run uses real builder (no drift) -----------------------------
+
+    def test_dry_run_uses_real_builder(self, tmp_path, capsys):
+        """Dry-run output contains the spec command from the real builder."""
+        with mock.patch("shutil.which", return_value=None):
+            with mock.patch("subprocess.run"), mock.patch("pathlib.Path.mkdir"):
+                main(self._base_args(tmp_path) + [
+                    "--mis-start", "3", "--bind", "--cut-primer", "--mono", "75.0",
+                ])
+        out = capsys.readouterr().out
+        assert "mfeprimer spec" in out
+        assert "--misStart 3" in out
+        assert "-b" in out
+        assert "--cutprimer" in out
+        assert "--mono 75.0" in out
+
+    def test_run_qc_spec_forwards_new_params(self, tmp_path):
+        """run_qc_spec passes new params through to run_mfeprimer_spec."""
+        p = tmp_path / "p.tsv"
+        d = tmp_path / "db.fasta"
+        p.write_text("primer_id\tforward\treverse\tmin_length\tmax_length\n")
+        d.write_text(">r1\nATCG\n")
+        # Pre-create output dirs so write_spec_primer_pairs succeeds.
+        out = tmp_path / "out"
+        (out / "spec").mkdir(parents=True)
+        (out / "index").mkdir(parents=True)
+        args = [
+            "qc-spec",
+            "--primers", str(p),
+            "--database", str(d),
+            "--outdir", str(out),
+            "--mis-start", "3",
+            "--mis-end", "7",
+            "--bind",
+            "--cut-primer",
+            "--mono", "75.0",
+            "--diva", "2.0",
+            "--dntp", "0.5",
+            "--oligo", "100.0",
+        ]
+        with mock.patch("shutil.which", return_value="/usr/bin/mfeprimer"):
+            with mock.patch("fullpcr.cli.run_mfeprimer_spec") as mock_spec:
+                with mock.patch("fullpcr.cli.read_primers") as mock_rp:
+                    from fullpcr.primers import Primer
+                    mock_rp.return_value = [
+                        Primer("test", "ATCG", "TGCA", 100, 400)
+                    ]
+                    with mock.patch("fullpcr.cli.prepare_spec_database") as mock_prep:
+                        mock_prep.return_value = (
+                            {"status": "success", "module": "index",
+                             "command": "", "output": "", "error_message": ""},
+                            {"prepared_record_count": 1, "source_record_count": 1,
+                             "status": "ok"},
+                        )
+                        main(args)
+
+        mock_spec.assert_called_once()
+        kwargs = mock_spec.call_args.kwargs
+        assert kwargs["mis_start"] == 3
+        assert kwargs["mis_end"] == 7
+        assert kwargs["bind"] is True
+        assert kwargs["cut_primer"] is True
+        assert kwargs["mono"] == 75.0
+        assert kwargs["diva"] == 2.0
+        assert kwargs["dntp"] == 0.5
+        assert kwargs["oligo"] == 100.0

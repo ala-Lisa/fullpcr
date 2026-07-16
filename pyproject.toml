@@ -24,5 +24,8 @@ gui = [
 [tool.setuptools.packages.find]
 include = ["fullpcr*"]
 
+[tool.setuptools.package-data]
+fullpcr = ["assets/*.png"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

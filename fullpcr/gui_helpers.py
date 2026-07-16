@@ -10,11 +10,12 @@ from __future__ import annotations
 import csv
 import gzip
 import os
+import signal
 import shutil
 import subprocess
 import sys
 import time
-from collections.abc import MutableMapping
+from collections.abc import Callable, MutableMapping
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as get_package_version
 from pathlib import Path
@@ -22,11 +23,14 @@ from pathlib import Path
 import pandas as pd
 
 
+_COMMAND_POLL_SECONDS = 1.0
+
+
 # ── Chinese translation helpers (display-layer only) ──────────────────
 
 
 def translate_status(value: str | None) -> str:
-    """Translate generic PASS/FAIL/WARN/TIMEOUT to Chinese.
+    """Translate generic PASS/FAIL/WARN/TIMEOUT/CANCELLED to Chinese.
 
     Used for command execution results, validation status, and
     file-load status — **not** for final_status (RECOMMENDED, etc.)
@@ -34,7 +38,7 @@ def translate_status(value: str | None) -> str:
 
     Args:
         value: Status string such as ``"PASS"``, ``"FAIL"``, ``"WARN"``,
-            ``"TIMEOUT"``, or ``None``.
+            ``"TIMEOUT"``, ``"CANCELLED"``, or ``None``.
 
     Returns:
         Chinese label, or the original string when no mapping exists.
@@ -48,6 +52,7 @@ def translate_status(value: str | None) -> str:
         "FAIL": "异常",
         "WARN": "警告",
         "TIMEOUT": "超时",
+        "CANCELLED": "用户已终止",
     }
     return mapping.get(value, value)
 
@@ -667,7 +672,7 @@ def build_qc_pre_command(
     mismatch: int = 2,
     dg: float = -5.0,
     tm: float = 50.0,
-    timeout: int | None = 60,
+    timeout: int | None = None,
 ) -> list[str]:
     """Build ``python -m fullpcr qc-pre`` command as list[str].
 
@@ -722,11 +727,19 @@ def build_qc_spec_command(
     min_size: int | None = 80,
     max_size: int = 500,
     tm: float = 50.0,
-    max_tm: float = 75.0,
+    max_tm: float = 100.0,
     mismatch: int = 2,
+    mis_start: int | None = None,
+    mis_end: int | None = None,
     cpu: int = 4,
     kvalue: int = 9,
-    timeout: int | None = 300,
+    bind: bool = False,
+    cut_primer: bool = False,
+    mono: float | None = None,
+    diva: float | None = None,
+    dntp: float | None = None,
+    oligo: float | None = None,
+    timeout: int | None = None,
     force: bool = True,
 ) -> list[str]:
     """Build ``python -m fullpcr qc-spec`` command as list[str]."""
@@ -748,6 +761,23 @@ def build_qc_spec_command(
     cmd.extend(["--cpu", str(cpu)])
     cmd.extend(["--kvalue", str(kvalue)])
 
+    if mis_start is not None:
+        cmd.extend(["--mis-start", str(mis_start)])
+    if mis_end is not None:
+        cmd.extend(["--mis-end", str(mis_end)])
+    if bind:
+        cmd.append("--bind")
+    if cut_primer:
+        cmd.append("--cut-primer")
+    if mono is not None:
+        cmd.extend(["--mono", str(mono)])
+    if diva is not None:
+        cmd.extend(["--diva", str(diva)])
+    if dntp is not None:
+        cmd.extend(["--dntp", str(dntp)])
+    if oligo is not None:
+        cmd.extend(["--oligo", str(oligo)])
+
     if timeout is not None:
         cmd.extend(["--timeout", str(timeout)])
     if force:
@@ -767,7 +797,7 @@ def build_obipcr_run_command(
     summarize: bool = True,
     report: bool = True,
     force: bool = True,
-    timeout: int | None = 300,
+    timeout: int | None = None,
 ) -> list[str]:
     """Build ``python -m fullpcr run`` command as list[str]."""
     cmd: list[str] = ["python3", "-m", "fullpcr", "run"]
@@ -822,16 +852,26 @@ def build_final_report_command(
 
 def run_gui_command(
     command: list[str],
-    timeout: int = 600,
+    timeout: int | float | None = None,
+    *,
+    cancel_requested: Callable[[], bool] | None = None,
+    on_process_started: Callable[[int], None] | None = None,
+    on_poll: Callable[[int], None] | None = None,
 ) -> dict:
-    """Execute a CLI command via ``subprocess.run(list[str])``.
+    """Execute a CLI command in its own process group.
 
     Args:
         command: The command as ``list[str]``.
-        timeout: Timeout in seconds.
+        timeout: Timeout in seconds, or ``None`` to wait without a deadline.
+        cancel_requested: Optional callback checked while an observed command
+            is running.  A true value stops the complete process group.
+        on_process_started: Optional callback receiving the new process-group
+            id immediately after the command starts.
+        on_poll: Optional best-effort observation callback receiving the
+            process-group id after each bounded wait.
 
     Returns:
-        dict with ``status`` (PASS/FAIL/TIMEOUT), ``returncode``,
+        dict with ``status`` (PASS/FAIL/TIMEOUT/CANCELLED), ``returncode``,
         ``stdout``, ``stderr``, ``command``, ``message``.
     """
     result: dict = {
@@ -844,16 +884,14 @@ def run_gui_command(
     }
 
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             command,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
+            shell=False,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired:
-        result["status"] = "TIMEOUT"
-        result["message"] = f"Command timed out after {timeout} s"
-        return result
     except FileNotFoundError:
         result["status"] = "FAIL"
         result["message"] = f"Executable not found: {command[0]}"
@@ -863,9 +901,101 @@ def run_gui_command(
         result["message"] = f"OS error: {exc}"
         return result
 
+    if on_process_started is not None:
+        try:
+            on_process_started(proc.pid)
+        except Exception:
+            # Monitoring must never turn a healthy analysis into a failure.
+            pass
+
+    def stop_process_group() -> tuple[str, str, str]:
+        cleanup_error = ""
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            cleanup_error = f"; process-group cleanup error: {exc}"
+
+        try:
+            stopped_stdout, stopped_stderr = proc.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                cleanup_error = f"; process-group cleanup error: {exc}"
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            stopped_stdout, stopped_stderr = proc.communicate()
+        return stopped_stdout or "", stopped_stderr or "", cleanup_error
+
+    observed = cancel_requested is not None or on_poll is not None
+    if observed:
+        deadline = None if timeout is None else time.monotonic() + float(timeout)
+        while True:
+            if cancel_requested is not None and cancel_requested():
+                stdout, stderr, cleanup_error = stop_process_group()
+                result.update(
+                    {
+                        "status": "CANCELLED",
+                        "returncode": proc.returncode,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                        "message": f"Analysis cancelled by user{cleanup_error}",
+                    }
+                )
+                return result
+
+            wait_seconds = _COMMAND_POLL_SECONDS
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    stdout, stderr, cleanup_error = stop_process_group()
+                    result.update(
+                        {
+                            "status": "TIMEOUT",
+                            "returncode": proc.returncode,
+                            "stdout": stdout,
+                            "stderr": stderr,
+                            "message": (
+                                f"Command timed out after {timeout} s"
+                                f"{cleanup_error}"
+                            ),
+                        }
+                    )
+                    return result
+                wait_seconds = min(wait_seconds, remaining)
+            try:
+                stdout, stderr = proc.communicate(timeout=wait_seconds)
+                break
+            except subprocess.TimeoutExpired:
+                if on_poll is not None:
+                    try:
+                        on_poll(proc.pid)
+                    except Exception:
+                        pass
+                continue
+    else:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            stdout, stderr, cleanup_error = stop_process_group()
+            result["status"] = "TIMEOUT"
+            result["returncode"] = proc.returncode
+            result["stdout"] = stdout
+            result["stderr"] = stderr
+            result["message"] = (
+                f"Command timed out after {timeout} s{cleanup_error}"
+            )
+            return result
+
     result["returncode"] = proc.returncode
-    result["stdout"] = proc.stdout
-    result["stderr"] = proc.stderr
+    result["stdout"] = stdout
+    result["stderr"] = stderr
 
     if proc.returncode == 0:
         result["status"] = "PASS"
@@ -1138,8 +1268,9 @@ def get_primer_preset(name: str) -> dict:
     """Return parameter defaults for a named primer preset.
 
     Args:
-        name: One of ``"12S/16S 短片段"``, ``"COI mini-barcode"``,
-            ``"COI Folmer"``, ``"Cytb"``, ``"自定义"``.
+        name: One of ``"默认参数"``, ``"12S/16S 短片段"``,
+            ``"COI mini-barcode"``, ``"COI Folmer"``, ``"Cytb"``,
+            ``"自定义"``.
 
     Returns:
         dict with keys ``description``, ``min_size``, ``max_size``,
@@ -1148,6 +1279,14 @@ def get_primer_preset(name: str) -> dict:
         ``None``).
     """
     presets: dict[str, dict] = {
+        "默认参数": {
+            "description": "使用 fullpcr 默认分析参数，适合首次使用",
+            "min_size": 80,
+            "max_size": 500,
+            "spec_mismatch": 2,
+            "obipcr_mismatches": "0,1,2",
+            "circular": True,
+        },
         "12S/16S 短片段": {
             "description": "适用于 12S/16S rRNA 短片段扩增；推荐长度 80-500 bp，circular 模式",
             "min_size": 80,
@@ -1221,7 +1360,7 @@ _WORKFLOW_PATH_KEYS: set[str] = {state_key for _, state_key in _WORKFLOW_PATH_MA
 
 #: Canonical defaults for ALL persisted widget state.
 #: Keys are canonical (stable across page switches); widget keys
-#: are derived by prefixing with ``_`` (e.g. ``_wf_s3_timeout``).
+#: are derived by prefixing with ``_`` (e.g. ``_wf_s3_cpu``).
 _CANONICAL_DEFAULTS: dict[str, object] = {
     # Inputs
     "inputs_primers_path": "example_data/primers.tsv",
@@ -1246,15 +1385,23 @@ _CANONICAL_DEFAULTS: dict[str, object] = {
     # Workflow — params
     "wf_s1_thermo": True, "wf_s1_dimer": True, "wf_s1_hairpin": True, "wf_s1_degen": True,
     "wf_s1_score": 5, "wf_s1_dg": -5.0, "wf_s1_tm": 50.0,
-    "wf_s1_mismatch": 2, "wf_s1_maxdeg": 256, "wf_s1_timeout": 60,
+    "wf_s1_mismatch": 2, "wf_s1_maxdeg": 256,
     "wf_s3_minsize": 80, "wf_s3_maxsize": 500, "wf_s3_mismatch": 2,
-    "wf_s3_timeout": 300,
-    "wf_s3_tm": 50.0, "wf_s3_maxtm": 75.0, "wf_s3_cpu": 4,
+    "wf_s3_tm": 50.0, "wf_s3_maxtm": 100.0, "wf_s3_cpu": 4,
     "wf_s3_kvalue": 9, "wf_s3_force": True,
+    # Phase 3D-2: spec custom params (None = use MFEprimer default)
+    "wf_s3_use_tm": False,
+    "wf_s3_use_misstart": False, "wf_s3_use_misend": False,
+    "wf_s3_use_mono": False, "wf_s3_use_diva": False,
+    "wf_s3_use_dntp": False, "wf_s3_use_oligo": False,
+    "wf_s3_misstart": None, "wf_s3_misend": None,
+    "wf_s3_bind": False, "wf_s3_cutprimer": False,
+    "wf_s3_mono": None, "wf_s3_diva": None,
+    "wf_s3_dntp": None, "wf_s3_oligo": None,
     "wf_s4_mismatches": "0,1,2", "wf_s4_circular": True,
     "wf_s4_summarize": True, "wf_s4_report": True,
-    "wf_s4_force": True, "wf_s4_timeout": 300,
-    "wf_preset_select": "自定义",
+    "wf_s4_force": True,
+    "wf_preset_select": "默认参数",
     # Results
     "res_final_dir": "final_results",
     "res_obipcr_dir": "obipcr_results",
@@ -1378,6 +1525,399 @@ def apply_project_paths_to_state(
                 state[state_key] = value
 
 
+# ── workspace upload session state ──────────────────────────────────────
+
+
+def init_workspace_session_state(state: MutableMapping) -> None:
+    """Initialise workspace-related keys in *state* if not already present.
+
+    Call once at app startup before rendering any workspace UI.
+
+    Keys initialised (all default to ``None`` or ``False``):
+        ``ws_run_id``, ``ws_uploads_dir``, ``ws_use_upload_primers``,
+        ``ws_use_upload_database``, ``ws_use_upload_taxonomy``,
+        ``ws_uploaded_primers_path``, ``ws_uploaded_database_path``,
+        ``ws_uploaded_taxonomy_path``.
+    """
+    defaults: dict[str, object] = {
+        "ws_run_id": None,
+        "ws_uploads_dir": None,
+        "ws_use_upload_primers": False,
+        "ws_use_upload_database": False,
+        "ws_use_upload_taxonomy": False,
+        "ws_uploaded_primers_path": None,
+        "ws_uploaded_database_path": None,
+        "ws_uploaded_taxonomy_path": None,
+    }
+    for key, default in defaults.items():
+        if key not in state:
+            state[key] = default
+
+
+def get_effective_primers_path(state: MutableMapping) -> str:
+    """Return the effective primers path: uploaded file or text input."""
+    if state.get("ws_use_upload_primers"):
+        uploaded = state.get("ws_uploaded_primers_path")
+        if uploaded:
+            return str(uploaded)
+    return str(state.get("inputs_primers_path", ""))
+
+
+def get_effective_database_path(state: MutableMapping) -> str:
+    """Return the effective database path: uploaded file or text input."""
+    if state.get("ws_use_upload_database"):
+        uploaded = state.get("ws_uploaded_database_path")
+        if uploaded:
+            return str(uploaded)
+    return str(state.get("inputs_database_path", ""))
+
+
+def get_effective_taxonomy_path(state: MutableMapping) -> str:
+    """Return the effective taxonomy path: uploaded file or text input."""
+    if state.get("ws_use_upload_taxonomy"):
+        uploaded = state.get("ws_uploaded_taxonomy_path")
+        if uploaded:
+            return str(uploaded)
+    return str(state.get("inputs_taxonomy_path", ""))
+
+
+def clear_upload_mode(state: MutableMapping, file_type: str) -> None:
+    """Switch a file type back to server-path mode and clear the uploaded path.
+
+    Args:
+        state: Session state dict.
+        file_type: One of ``"primers"``, ``"database"``, ``"taxonomy"``.
+    """
+    key_map = {
+        "primers": ("ws_use_upload_primers", "ws_uploaded_primers_path"),
+        "database": ("ws_use_upload_database", "ws_uploaded_database_path"),
+        "taxonomy": ("ws_use_upload_taxonomy", "ws_uploaded_taxonomy_path"),
+    }
+    entry = key_map.get(file_type)
+    if entry:
+        use_key, path_key = entry
+        state[use_key] = False
+        state[path_key] = None
+
+
+def build_spec_index_database_path(
+    qc_spec_results_dir: str,
+    database_path: str,
+) -> str:
+    """Compute the normalised ``spec/index/`` database path for qc-spec.
+
+    Uses the **basename** of *database_path* so that upload-normalised
+    ``database.fasta`` and server-path ``reference.fa`` both produce the
+    correct index filename.
+
+    Args:
+        qc_spec_results_dir: The ``qc_spec_results/`` directory path.
+        database_path: The effective database path (uploaded or server).
+
+    Returns:
+        ``<qc_spec_results_dir>/index/<basename>``, or ``""`` when
+        *qc_spec_results_dir* or *database_path* is empty.
+    """
+    if not qc_spec_results_dir or not database_path:
+        return ""
+    return str(Path(qc_spec_results_dir) / "index" / Path(database_path).name)
+
+
+# ── manual primer entry ──────────────────────────────────────────────────
+
+_DNA_IUPAC_CHARS: set[str] = set("ACGTRYSWKMBDHVN")
+
+_PRIMERS_TSV_FIELDNAMES = ["primer_id", "forward", "reverse", "min_length", "max_length"]
+
+
+def _is_safe_primer_id(pid: str) -> bool:
+    """Reject primer IDs with ``/``, ``\\``, ``..``, or any non-printable
+    character (including C0 controls and DEL)."""
+    if not pid.isprintable():
+        return False
+    if "/" in pid or "\\" in pid:
+        return False
+    if ".." in pid:
+        return False
+    return True
+
+
+def build_manual_primers_tsv(rows: list[dict[str, str]]) -> dict:
+    """Validate manual primer rows and produce a ``primers.tsv`` byte string.
+
+    Args:
+        rows: List of dicts, each with keys ``primer_id``, ``forward``,
+            ``reverse``, ``min_length``, ``max_length``.
+
+    Returns:
+        dict with ``status`` (PASS/FAIL), ``content`` (UTF-8 TSV bytes or
+        None), ``normalized_rows`` (list of cleaned dicts or None),
+        ``error`` (Chinese message or None).
+    """
+    if not rows:
+        return _manual_fail("至少需要填写一对引物。")
+
+    required = _PRIMERS_TSV_FIELDNAMES
+    seen_ids: set[str] = set()
+    normalized: list[dict[str, str]] = []
+
+    _FIELD_CN = {
+        "primer_id": "引物名称", "forward": "前向引物",
+        "reverse": "反向引物", "min_length": "最小扩增长度",
+        "max_length": "最大扩增长度",
+    }
+
+    for i, row in enumerate(rows, start=1):
+        for field in required:
+            if not row.get(field, "").strip():
+                return _manual_fail(
+                    f"第 {i} 行：{_FIELD_CN.get(field, field)} 不能为空。"
+                )
+
+        pid = row["primer_id"].strip()
+        fwd = row["forward"].strip().upper()
+        rev = row["reverse"].strip().upper()
+        raw_min = row["min_length"].strip()
+        raw_max = row["max_length"].strip()
+
+        if not _is_safe_primer_id(pid):
+            return _manual_fail(
+                f"第 {i} 行：引物名称包含控制字符或不允许的字符。"
+            )
+
+        if pid in seen_ids:
+            return _manual_fail(f"第 {i} 行：引物名称 '{pid}' 重复。")
+        seen_ids.add(pid)
+
+        invalid_fwd = [c for c in fwd if c not in _DNA_IUPAC_CHARS]
+        if invalid_fwd:
+            return _manual_fail(
+                f"第 {i} 行：前向引物包含非法字符 "
+                f"'{'、'.join(sorted(set(invalid_fwd)))}'。"
+                f"仅允许标准 IUPAC DNA 字符。"
+            )
+        invalid_rev = [c for c in rev if c not in _DNA_IUPAC_CHARS]
+        if invalid_rev:
+            return _manual_fail(
+                f"第 {i} 行：反向引物包含非法字符 "
+                f"'{'、'.join(sorted(set(invalid_rev)))}'。"
+                f"仅允许标准 IUPAC DNA 字符。"
+            )
+
+        try:
+            min_len = int(raw_min)
+        except ValueError:
+            return _manual_fail(
+                f"第 {i} 行：最小扩增长度 '{raw_min}' 不是有效整数。"
+            )
+        try:
+            max_len = int(raw_max)
+        except ValueError:
+            return _manual_fail(
+                f"第 {i} 行：最大扩增长度 '{raw_max}' 不是有效整数。"
+            )
+        if min_len <= 0:
+            return _manual_fail(
+                f"第 {i} 行：最小扩增长度必须为正整数（当前: {min_len}）。"
+            )
+        if max_len <= 0:
+            return _manual_fail(
+                f"第 {i} 行：最大扩增长度必须为正整数（当前: {max_len}）。"
+            )
+        if min_len > max_len:
+            return _manual_fail(
+                f"第 {i} 行：最小扩增长度 ({min_len}) "
+                f"不能大于最大扩增长度 ({max_len})。"
+            )
+
+        normalized.append({
+            "primer_id": pid, "forward": fwd, "reverse": rev,
+            "min_length": str(min_len), "max_length": str(max_len),
+        })
+
+    import io
+
+    buf = io.StringIO(newline="")
+    writer = csv.DictWriter(
+        buf,
+        fieldnames=_PRIMERS_TSV_FIELDNAMES,
+        delimiter="\t",
+        lineterminator="\n",
+    )
+    writer.writeheader()
+    writer.writerows(normalized)
+    content = buf.getvalue().encode("utf-8")
+    buf.close()
+
+    return {"status": "PASS", "content": content, "normalized_rows": normalized, "error": None}
+
+
+def _manual_fail(error: str) -> dict:
+    return {"status": "FAIL", "content": None, "normalized_rows": None, "error": error}
+
+
+# ── full pipeline plan & executor ────────────────────────────────────────
+
+_STEP_SPEC: list[dict[str, object]] = [
+    {"key": "s1", "result_key": "wf_s1_result", "label": "基础质控"},
+    {"key": "s2", "result_key": "wf_s2_result", "label": "质控汇总"},
+    {"key": "s3", "result_key": "wf_s3_result", "label": "特异性分析"},
+    {"key": "s4", "result_key": "wf_s4_result", "label": "obipcr 全库模拟 PCR"},
+    {"key": "s5", "result_key": "wf_s5_result", "label": "最终综合报告"},
+]
+
+
+def build_full_pipeline_plan(
+    *,
+    qc_pre_command: list[str],
+    qc_summary_command: list[str],
+    qc_spec_command: list[str],
+    obipcr_command: list[str],
+    final_report_command: list[str],
+    qc_pre_timeout: int | float | None = None,
+    qc_summary_timeout: int | float | None = None,
+    qc_spec_timeout: int | float | None = None,
+    obipcr_timeout: int | float | None = None,
+    final_report_timeout: int | float | None = None,
+) -> list[dict]:
+    """Build the ordered five-step execution plan.
+
+    Each returned step is a dict with ``key``, ``result_key``, ``label``,
+    ``command``, and ``timeout``.  The caller can pass this plan to
+    :func:`run_full_pipeline`.
+    """
+    commands = [
+        qc_pre_command,
+        qc_summary_command,
+        qc_spec_command,
+        obipcr_command,
+        final_report_command,
+    ]
+    timeouts = [
+        qc_pre_timeout,
+        qc_summary_timeout,
+        qc_spec_timeout,
+        obipcr_timeout,
+        final_report_timeout,
+    ]
+    plan: list[dict] = []
+    for spec, cmd, t in zip(_STEP_SPEC, commands, timeouts):
+        plan.append({
+            "key": spec["key"],
+            "result_key": spec["result_key"],
+            "label": spec["label"],
+            "command": list(cmd),
+            "timeout": t,
+        })
+    return plan
+
+
+def run_full_pipeline(
+    plan: list[dict],
+    *,
+    runner: object = None,
+    on_progress: Callable[[dict], None] | None = None,
+) -> dict:
+    """Execute *plan* sequentially, stopping on failure, timeout or cancellation.
+
+    Args:
+        plan: Output of :func:`build_full_pipeline_plan`.
+        runner: A callable ``(command, timeout) -> dict``.  Defaults to
+            :func:`run_gui_command`.
+        on_progress: Optional callback receiving one event dict immediately
+            before and after each executed step.  Events contain ``index``,
+            ``total``, ``key``, ``label``, ``phase`` and ``status``.
+
+    Returns:
+        dict with ``status``, ``results``, ``completed_steps``,
+        ``failed_step``, ``message``.
+    """
+    if runner is None:
+        runner = run_gui_command  # type: ignore[assignment]
+
+    results: dict[str, dict] = {}
+    completed: list[str] = []
+    failed: str | None = None
+    final_status = "PASS"
+
+    total_steps = len(plan)
+    for index, step in enumerate(plan, start=1):
+        if on_progress is not None:
+            on_progress(
+                {
+                    "index": index,
+                    "total": total_steps,
+                    "key": step["key"],
+                    "label": step["label"],
+                    "phase": "running",
+                    "status": None,
+                }
+            )
+        result = runner(step["command"], timeout=step["timeout"])  # type: ignore[call-arg]
+        results[step["result_key"]] = result
+
+        st = result.get("status")
+        if on_progress is not None:
+            on_progress(
+                {
+                    "index": index,
+                    "total": total_steps,
+                    "key": step["key"],
+                    "label": step["label"],
+                    "phase": "finished",
+                    "status": st,
+                }
+            )
+        if st == "PASS":
+            completed.append(step["key"])
+        elif st == "TIMEOUT":
+            failed = step["key"]
+            final_status = "TIMEOUT"
+            break
+        elif st == "CANCELLED":
+            failed = step["key"]
+            final_status = "CANCELLED"
+            break
+        else:
+            # FAIL, None, or any other value → treat as failure.
+            failed = step["key"]
+            if final_status == "PASS":
+                final_status = "FAIL"
+            break
+
+    if final_status == "PASS":
+        message = "全部五步完成。"
+    elif final_status == "TIMEOUT":
+        message = f"第 {_step_index(failed)} 步（{_step_label(plan, failed)}）超时，流程已停止。"
+    elif final_status == "CANCELLED":
+        message = "分析已由用户终止。"
+    else:
+        message = f"第 {_step_index(failed)} 步（{_step_label(plan, failed)}）失败，流程已停止。"
+
+    return {
+        "status": final_status,
+        "results": results,
+        "completed_steps": completed,
+        "failed_step": failed,
+        "message": message,
+    }
+
+
+def _step_index(key: str | None) -> str:
+    if key is None:
+        return "?"
+    return {"s1": "1", "s2": "2", "s3": "3", "s4": "4", "s5": "5"}.get(key, "?")
+
+
+def _step_label(plan: list[dict], key: str | None) -> str:
+    if key is None:
+        return "未知"
+    for s in plan:
+        if s["key"] == key:
+            return str(s["label"])
+    return "未知"
+
+
 # ── primer preset application ────────────────────────────────────────────
 
 #: The 5 canonical keys that :func:`apply_primer_preset_to_state` is
@@ -1414,3 +1954,283 @@ def apply_primer_preset_to_state(
         if val is not None:
             state[state_key] = val
             state[_widget_key(state_key)] = val
+
+
+# ── Phase 3D-3A: raw spec TSV + results archive ──────────────────────────
+
+
+def get_raw_spec_tsv_info(qc_spec_results_dir: str | Path) -> dict:
+    """Locate the raw MFEprimer spec TSV for download.
+
+    Returns a dict with keys ``status``, ``path``, ``file_name``,
+    ``size``, and ``error``.  Never raises — failures are returned as
+    ``status="FAIL"`` with a Chinese error message.
+
+    Args:
+        qc_spec_results_dir: Path to the ``qc_spec_results`` directory.
+    """
+    result: dict = {
+        "status": "FAIL",
+        "path": "",
+        "file_name": "spec_output.txt.spec.tsv",
+        "size": 0,
+        "error": "",
+    }
+    rd = Path(qc_spec_results_dir)
+
+    # Directory checks.
+    if not rd.exists():
+        result["error"] = f"目录不存在: {rd}"
+        return result
+    if rd.is_symlink():
+        result["error"] = f"目录是符号链接，拒绝访问: {rd}"
+        return result
+    if not rd.is_dir():
+        result["error"] = f"路径不是目录: {rd}"
+        return result
+
+    target = rd / "spec" / "spec_output.txt.spec.tsv"
+
+    # Symlink check on intermediate path.
+    try:
+        resolved_parts = target.resolve().parts
+        rd_resolved = rd.resolve()
+        if rd_resolved not in target.resolve().parents and rd_resolved != target.resolve():
+            result["error"] = f"文件路径包含符号链接，拒绝访问: {target}"
+            return result
+    except OSError as exc:
+        result["error"] = f"无法解析文件路径: {exc}"
+        return result
+
+    if target.is_symlink():
+        result["error"] = f"文件是符号链接，拒绝访问: {target}"
+        return result
+    if not target.exists():
+        result["error"] = f"原始 spec TSV 不存在: {target}"
+        return result
+    if not target.is_file():
+        result["error"] = f"目标路径不是普通文件: {target}"
+        return result
+
+    try:
+        size = target.stat().st_size
+    except OSError as exc:
+        result["error"] = f"无法读取文件信息: {exc}"
+        return result
+
+    result["status"] = "PASS"
+    result["path"] = str(target.resolve())
+    result["size"] = size
+    return result
+
+
+def build_results_archive(
+    output_root: str | Path,
+    *,
+    included_dirs: list[str] | tuple[str, ...] | None = None,
+    archive_name: str = "fullpcr_results.zip",
+) -> dict:
+    """Create a ZIP archive of selected results under *output_root*.
+
+    The archive is written to
+    ``<output_root>/.fullpcr_downloads/<archive_name>`` via an atomic
+    temp-file + ``os.replace`` step.  When *included_dirs* is ``None``,
+    every regular file below *output_root* is included.  Otherwise only
+    the named top-level directories are traversed.
+
+    Returns a dict with keys ``status``, ``path``, ``file_name``,
+    ``file_count``, ``size``, and ``error``.
+    """
+    import os
+    import tempfile
+    import zipfile
+
+    result: dict = {
+        "status": "FAIL",
+        "path": "",
+        "file_name": archive_name,
+        "file_count": 0,
+        "size": 0,
+        "error": "",
+    }
+    root = Path(output_root)
+
+    archive_path = Path(archive_name)
+    if (
+        not archive_name
+        or archive_path.name != archive_name
+        or "/" in archive_name
+        or "\\" in archive_name
+        or archive_path.suffix.lower() != ".zip"
+    ):
+        result["error"] = f"ZIP 文件名不安全: {archive_name}"
+        return result
+
+    selected_dirs: tuple[str, ...] | None = None
+    if included_dirs is not None:
+        selected: list[str] = []
+        for raw_name in included_dirs:
+            name = str(raw_name).strip()
+            candidate = Path(name)
+            if (
+                not name
+                or candidate.name != name
+                or "/" in name
+                or "\\" in name
+                or name in {".", "..", ".fullpcr_downloads", ".fullpcr_jobs"}
+            ):
+                result["error"] = f"打包目录名称不安全: {raw_name}"
+                return result
+            if name not in selected:
+                selected.append(name)
+        if not selected:
+            result["error"] = "未选择任何可打包的结果目录。"
+            return result
+        selected_dirs = tuple(selected)
+
+    # Safety: reject symlinks and non-directories.
+    if root.is_symlink():
+        result["error"] = f"输出根目录是符号链接，拒绝访问: {root}"
+        return result
+    if not root.exists():
+        result["error"] = f"输出根目录不存在: {root}"
+        return result
+    if not root.is_dir():
+        result["error"] = f"输出根路径不是目录: {root}"
+        return result
+
+    downloads_dir = root / ".fullpcr_downloads"
+    jobs_dir = root / ".fullpcr_jobs"
+    zip_path = downloads_dir / archive_name
+
+    # ── pre-check downloads_dir before any traversal ──────────────────
+    if downloads_dir.is_symlink():
+        result["error"] = (
+            f"下载目录是符号链接，拒绝访问: {downloads_dir}"
+        )
+        return result
+    if downloads_dir.exists() and not downloads_dir.is_dir():
+        result["error"] = (
+            f"下载目录路径已存在但不是目录: {downloads_dir}"
+        )
+        return result
+
+    # ── collect regular files, reject special files ──────────────────
+    file_list: list[Path] = []
+    scan_roots: list[Path]
+    if selected_dirs is None:
+        scan_roots = [root]
+    else:
+        scan_roots = []
+        for name in selected_dirs:
+            selected_root = root / name
+            if selected_root.is_symlink():
+                result["error"] = f"所选结果目录是符号链接，拒绝访问: {selected_root}"
+                return result
+            if not selected_root.exists():
+                result["error"] = f"所选结果目录不存在: {selected_root}"
+                return result
+            if not selected_root.is_dir():
+                result["error"] = f"所选结果路径不是目录: {selected_root}"
+                return result
+            scan_roots.append(selected_root)
+
+    entries: list[Path] = []
+    try:
+        for scan_root in scan_roots:
+            entries.extend(scan_root.rglob("*"))
+        entries.sort()
+    except OSError as exc:
+        result["error"] = f"遍历输出目录失败: {exc}"
+        return result
+
+    for entry in entries:
+        # Skip internal application-state subtrees entirely.
+        is_internal = False
+        for internal_dir in (downloads_dir, jobs_dir):
+            try:
+                entry.relative_to(internal_dir)
+                is_internal = True
+                break
+            except ValueError:
+                pass
+        if is_internal:
+            continue
+
+        if entry.is_symlink():
+            result["error"] = f"检测到符号链接，拒绝打包: {entry}"
+            return result
+
+        if entry.is_dir():
+            continue
+        if entry.is_file():
+            file_list.append(entry)
+            continue
+        # FIFO, socket, device, etc.
+        result["error"] = (
+            f"检测到不支持的文件类型，拒绝打包: {entry}"
+        )
+        return result
+
+    if not file_list:
+        result["error"] = "没有可打包的文件。"
+        return result
+
+    # ── create downloads_dir (may raise OSError) ─────────────────────
+    try:
+        downloads_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        result["error"] = f"无法创建下载目录: {exc}"
+        return result
+
+    # ── temp file for atomic write ──────────────────────────────────
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            suffix=".zip", prefix=".fullpcr_tmp_", dir=str(downloads_dir),
+        )
+    except OSError as exc:
+        result["error"] = f"无法创建临时文件: {exc}"
+        return result
+    os.close(fd)
+    tmp = Path(tmp_path)
+
+    try:
+        with zipfile.ZipFile(str(tmp), "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+            for fp in file_list:
+                arcname = str(fp.relative_to(root).as_posix())
+                zf.write(str(fp), arcname=arcname)
+    except Exception as exc:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        result["error"] = f"ZIP 创建失败: {exc}"
+        return result
+
+    # ── read temp size before replacing (avoid broken state) ─────────
+    try:
+        zip_size = tmp.stat().st_size
+    except OSError as exc:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        result["error"] = f"无法读取临时 ZIP 大小: {exc}"
+        return result
+
+    # ── atomic replace ──────────────────────────────────────────────
+    try:
+        os.replace(str(tmp), str(zip_path))
+    except OSError as exc:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        result["error"] = f"ZIP 替换失败: {exc}"
+        return result
+
+    result["status"] = "PASS"
+    result["path"] = str(zip_path.resolve())
+    result["file_count"] = len(file_list)
+    result["size"] = zip_size
+    return result

@@ -19,6 +19,7 @@ from fullpcr.mfeprimer_runner import (
     build_mfeprimer_degen_command,
     build_mfeprimer_dimer_command,
     build_mfeprimer_hairpin_command,
+    build_mfeprimer_spec_command,
     build_mfeprimer_thermo_command,
     check_mfeprimer_available,
     run_mfeprimer_degen,
@@ -526,15 +527,31 @@ def run_qc_spec(args: argparse.Namespace) -> None:
             f"-k {args.kvalue} -c {args.cpu}"
         )
         print(f"  5. 验证索引输出文件完整性")
+        # Use the real builder so the printed command always matches what
+        # a real run would execute — no drift between dry-run and live.
         spec_prefix = outdir / "spec" / "spec_output.txt"
-        print(
-            f"  6. 运行 spec: mfeprimer spec "
-            f"-i {outdir / 'spec' / 'spec_primer_pairs.tsv'} "
-            f"-d {outdir / 'index' / Path(args.database).name} "
-            f"-o {spec_prefix} "
-            f"-S {args.max_size} -t {args.tm} -T {args.max_tm} "
-            f"-k {args.kvalue} -c {args.cpu}"
+        spec_cfg = build_mfeprimer_spec_command(
+            primer_pairs_tsv=str(outdir / "spec" / "spec_primer_pairs.tsv"),
+            database_path=str(outdir / "index" / Path(args.database).name),
+            out_prefix=str(spec_prefix),
+            min_size=args.min_size,
+            max_size=args.max_size,
+            tm=args.tm,
+            max_tm=args.max_tm,
+            mismatch=args.mismatch,
+            mis_start=args.mis_start,
+            mis_end=args.mis_end,
+            cpu=args.cpu,
+            kvalue=args.kvalue,
+            max_amp_count=10000,
+            bind=args.bind,
+            cut_primer=args.cut_primer,
+            mono=args.mono,
+            diva=args.diva,
+            dntp=args.dntp,
+            oligo=args.oligo,
         )
+        print(f"  6. 运行 spec: {' '.join(spec_cfg.command)}")
         print(f"  7. 解析 {spec_prefix}.spec.tsv → primer_spec.tsv")
         print(f"  8. 写入 database_stats.tsv")
         if not mfeprimer_ok:
@@ -657,9 +674,17 @@ def run_qc_spec(args: argparse.Namespace) -> None:
             tm=args.tm,
             max_tm=args.max_tm,
             mismatch=args.mismatch,
+            mis_start=args.mis_start,
+            mis_end=args.mis_end,
             cpu=args.cpu,
             kvalue=args.kvalue,
             max_amp_count=10000,
+            bind=args.bind,
+            cut_primer=args.cut_primer,
+            mono=args.mono,
+            diva=args.diva,
+            dntp=args.dntp,
+            oligo=args.oligo,
             resume=args.resume,
             force=args.force,
             timeout=args.timeout,
@@ -754,8 +779,26 @@ def run_final_report(args: argparse.Namespace) -> None:
     print("Done.")
 
 
-def run_gui() -> None:
-    """Launch the Streamlit GUI app."""
+def run_gui(
+    host: str = "127.0.0.1",
+    port: int = 8501,
+    data_dir: str | None = None,
+) -> None:
+    """Launch the Streamlit GUI app.
+
+    Args:
+        host: Server bind address (default 127.0.0.1).  Use ``0.0.0.0``
+            to accept connections from other LAN devices.
+        port: TCP port (default 8501, range 1-65535).
+        data_dir: Optional persistent data directory for uploads and run
+            results.  When provided it is created if missing, normalised
+            to an absolute path, and passed to the Streamlit subprocess
+            via the ``FULLPCR_DATA_DIR`` environment variable.  When
+            omitted the existing ``FULLPCR_DATA_DIR`` env var (if set)
+            is inherited; otherwise ``web_workspace`` falls back to
+            ``./data``.
+    """
+    import os as _os
     import shutil
     import subprocess
 
@@ -776,10 +819,48 @@ def run_gui() -> None:
         )
         sys.exit(1)
 
-    cmd: list[str] = ["streamlit", "run", str(gui_app_path)]
+    # ── resolve and validate data_dir ─────────────────────────────────
+    resolved_data_dir: str | None = None
+    if data_dir is not None:
+        p = Path(data_dir).expanduser().resolve()
+        if p.exists() and not p.is_dir():
+            print(
+                f"错误: --data-dir 路径已存在但不是目录: {p}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(
+                f"错误: 无法创建 --data-dir 目录: {p}\n{exc}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        resolved_data_dir = str(p)
+
+    # ── build subprocess environment ──────────────────────────────────
+    env = _os.environ.copy()
+    if resolved_data_dir is not None:
+        env["FULLPCR_DATA_DIR"] = resolved_data_dir
+    # When data_dir is None, inherit any existing FULLPCR_DATA_DIR from
+    # the parent environment; web_workspace falls back to ./data if the
+    # variable is absent or empty.
+
+    cmd: list[str] = [
+        "streamlit", "run", str(gui_app_path),
+        "--server.address", host,
+        "--server.port", str(port),
+        "--client.toolbarMode", "minimal",
+        "--theme.base", "light",
+        "--theme.primaryColor", "#2eae7b",
+        "--theme.backgroundColor", "#f7f9f5",
+        "--theme.secondaryBackgroundColor", "#ffffff",
+        "--theme.textColor", "#102a43",
+    ]
 
     try:
-        subprocess.run(cmd, check=False)
+        completed = subprocess.run(cmd, env=env, check=False)
     except FileNotFoundError:
         print(
             "错误: streamlit 未找到。\n"
@@ -790,6 +871,24 @@ def run_gui() -> None:
         sys.exit(1)
     except KeyboardInterrupt:
         print("\nGUI 已停止。")
+    else:
+        if completed.returncode != 0:
+            raise SystemExit(completed.returncode)
+
+
+def _port_type(value: str) -> int:
+    """Argparse type: reject ports outside 1-65535."""
+    try:
+        p = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"端口号必须是整数: '{value}'"
+        ) from None
+    if p < 1 or p > 65535:
+        raise argparse.ArgumentTypeError(
+            f"端口号必须在 1-65535 之间: {p}"
+        )
+    return p
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -1056,6 +1155,52 @@ def main(argv: list[str] | None = None) -> None:
         help="k-mer size for indexing/spec (default: 9)",
     )
     qc_spec_parser.add_argument(
+        "--mis-start",
+        type=int,
+        default=None,
+        help="Mismatch start position from 3' end (--misStart, default: 1)",
+    )
+    qc_spec_parser.add_argument(
+        "--mis-end",
+        type=int,
+        default=None,
+        help="Mismatch end position from 3' end (--misEnd, default: 9)",
+    )
+    qc_spec_parser.add_argument(
+        "-b", "--bind",
+        action="store_true",
+        help="Print specific and nonspecific binding sites for each primer",
+    )
+    qc_spec_parser.add_argument(
+        "--cut-primer",
+        action="store_true",
+        help="Cut primer from amplicons (--cutprimer)",
+    )
+    qc_spec_parser.add_argument(
+        "--mono",
+        type=float,
+        default=None,
+        help="Monovalent cation concentration in mM (default: 50)",
+    )
+    qc_spec_parser.add_argument(
+        "--diva",
+        type=float,
+        default=None,
+        help="Divalent cation concentration in mM (default: 1.5)",
+    )
+    qc_spec_parser.add_argument(
+        "--dntp",
+        type=float,
+        default=None,
+        help="dNTP concentration in mM (default: 0.25)",
+    )
+    qc_spec_parser.add_argument(
+        "--oligo",
+        type=float,
+        default=None,
+        help="Annealing oligo concentration in nM (default: 50)",
+    )
+    qc_spec_parser.add_argument(
         "--timeout",
         type=float,
         default=None,
@@ -1100,9 +1245,29 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     # -- gui -----------------------------------------------------------
-    subparsers.add_parser(
+    gui_parser = subparsers.add_parser(
         "gui",
         help="Launch the fullpcr Streamlit GUI",
+    )
+    gui_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Server bind address (default: 127.0.0.1).  Use 0.0.0.0 for LAN access.",
+    )
+    gui_parser.add_argument(
+        "--port",
+        type=_port_type,
+        default=8501,
+        help="TCP port (default: 8501, range 1-65535).",
+    )
+    gui_parser.add_argument(
+        "--data-dir",
+        default=None,
+        help=(
+            "Persistent data directory for uploaded files and run results.  "
+            "Created if missing.  When omitted, the FULLPCR_DATA_DIR "
+            "environment variable is inherited; otherwise falls back to ./data."
+        ),
     )
 
     args = parser.parse_args(argv)
@@ -1131,7 +1296,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "final-report":
         run_final_report(args)
     elif args.command == "gui":
-        run_gui()
+        run_gui(host=args.host, port=args.port, data_dir=args.data_dir)
     else:
         parser.print_help()
         sys.exit(1)

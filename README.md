@@ -447,6 +447,96 @@ python -m fullpcr gui
 
 Both methods are equivalent. Method 2 provides a clear error message with install instructions if streamlit is missing.
 
+**Default behaviour:** binds to `127.0.0.1:8501` — only the local machine can access it.
+
+#### Local-only access
+
+```bash
+python -m fullpcr gui
+```
+
+Open in browser: `http://127.0.0.1:8501`
+
+#### LAN access (regular Linux / company server)
+
+```bash
+python -m fullpcr gui --host 0.0.0.0 --port 8501
+```
+
+Other devices on the same network access the GUI at:
+
+```
+http://<server-LAN-IP>:8501
+```
+
+Important notes:
+
+- `0.0.0.0` is a **bind address** — it tells the server to accept connections on all interfaces. It is **not** a browser URL. Browsers must use the server's real LAN IP.
+- The client device must have network connectivity to the server (same subnet, no AP/client isolation).
+- The server's operating system or company firewall must allow inbound TCP on the chosen port.
+- Do **not** configure router port forwarding to expose this service to the public internet.
+
+#### WSL (Windows Subsystem for Linux)
+
+WSL networking behaviour depends on the WSL version and mode:
+
+| Mode | Windows browser | Other WiFi devices |
+|------|-----------------|-------------------|
+| WSL2 default NAT | Try `http://localhost:8501` | Usually **not** reachable directly |
+| WSL2 mirrored mode | `http://localhost:8501` | May be reachable via host LAN IP |
+| WSL1 | `http://localhost:8501` | May be reachable via host LAN IP |
+
+Check your WSL networking mode:
+
+```bash
+grep -i microsoft /proc/version    # confirms WSL
+hostname -I                         # WSL NAT IP (e.g. 172.x) vs LAN IP
+```
+
+If you need external device access under WSL2 NAT mode, see Microsoft's official documentation:
+
+<https://learn.microsoft.com/en-us/windows/wsl/networking>
+
+Mirrored mode or a Windows `netsh interface portproxy` rule may be required. Any portproxy configuration must follow company security policy and is outside the scope of this tool.
+
+#### Security
+
+The current Streamlit GUI does **not** have built-in login authentication or TLS encryption:
+
+- Only use on a trusted internal network (company LAN or home WiFi).
+- Do **not** expose the GUI to the public internet via router port forwarding.
+- Do **not** bind to `0.0.0.0` on a machine directly connected to a public network.
+- For production or cross-network deployment, place the service behind a **reverse proxy** (e.g. nginx, Caddy) with HTTPS and identity authentication. This will be covered in a later deployment phase.
+
+#### Troubleshooting connectivity
+
+Check the server's IP addresses:
+
+```bash
+hostname -I
+ip -4 addr
+```
+
+Verify Streamlit is listening on the expected interface:
+
+```bash
+ss -ltnp | grep 8501
+# Expected: 0.0.0.0:8501 (or 127.0.0.1:8501 for local-only)
+```
+
+Test the server locally:
+
+```bash
+curl http://127.0.0.1:8501/_stcore/health
+# Expected: ok
+```
+
+Common issues:
+
+- **Firewall**: Linux `ufw`/`firewalld`, Windows Defender Firewall, or corporate firewall may block the port.
+- **AP/client isolation**: Some WiFi access points prevent wireless clients from communicating with each other.
+- **WSL NAT**: Other devices on the same WiFi generally cannot reach WSL2's internal NAT IP. Use mirrored mode, portproxy, or run on a native Linux server.
+
 ### GUI pages
 
 | Page | Function |
@@ -463,6 +553,191 @@ The header bar includes an **environment popover** (🟢/🔴 indicator) showing
 2. **分析工作台** — validate input file formats, apply a primer preset, preview commands in dry-run mode, then execute each step in order
 3. **结果总览** — review primer rankings, scores, and status breakdowns
 4. **报告与下载** — read the final evaluation report and obipcr report, download as needed
+
+## 迁移到 Linux / 公司内部服务器
+
+以下步骤适用于将 fullpcr 部署到一台干净的 Linux 服务器（如 Ubuntu 22.04/24.04、CentOS Stream 9、Rocky Linux 9）。
+
+### 环境要求
+
+- **Python** >= 3.10，且必须能够创建带 pip 的虚拟环境（`python3 -m venv` 需包含 ensurepip 模块）。
+  - Debian/Ubuntu 系统可能需要管理员预先安装 `python3-venv` 软件包。
+  - 其他发行版请使用对应的 Python 虚拟环境支持包，确保 `python3 -m venv` 可正常创建含 pip 的环境。
+- **obipcr** 和 **mfeprimer** 已安装并在 PATH 中可用
+- 运行用户对数据目录有读写权限
+
+### 部署步骤
+
+```bash
+# 1. 创建虚拟环境
+python3 -m venv fullpcr-venv
+source fullpcr-venv/bin/activate
+
+# 2. 以非 editable 方式安装 fullpcr（包含 GUI 可选依赖）
+cd fullpcr
+pip install ".[gui]"
+
+# 3. 创建数据目录（必须对运行用户可写）
+mkdir -p /srv/fullpcr/data
+
+# 4. 启动 GUI
+python -m fullpcr gui \
+  --host 0.0.0.0 \
+  --port 8501 \
+  --data-dir /srv/fullpcr/data
+```
+
+### 参数说明
+
+- `--host 0.0.0.0` — 允许内网其他设备访问。仅在可信内网中使用。
+- `--port 8501` — Streamlit 默认端口，按需修改。
+- `--data-dir /srv/fullpcr/data` — 保存上传文件和每次分析运行结果的持久化目录。目录不存在时自动创建。
+
+### 迁移数据目录
+
+新旧服务器的数据目录绝对路径可以不同。迁移步骤：
+
+1. 在运行 fullpcr GUI 的终端按 **Ctrl+C** 停止服务。
+2. 等待启动命令结束并返回 shell 提示符，确认服务已经退出。
+3. 将整个数据目录复制到新服务器：
+
+```bash
+rsync -av /srv/fullpcr/data/ new-server:/new/path/fullpcr/data/
+```
+
+4. 复制完成后，将新服务器的启动参数或环境变量更新为新路径：
+   - CLI 参数：`--data-dir /new/path/fullpcr/data`
+   - 或环境变量：`FULLPCR_DATA_DIR=/new/path/fullpcr/data`
+5. 确认新目录归实际运行用户所有或至少可读写。
+6. 启动新服务。
+7. 迁移后验证历史 run 目录和文件完整性（参考下方验收清单）。
+
+> 如果公司服务器使用自己的服务管理平台，请使用公司批准的方式停机和启动。
+
+### 网络安全警告
+
+- 当前版本**无内置登录认证和 TLS 加密**。
+- 仅在可信内网中绑定 `0.0.0.0`。
+- 如需跨网段访问，应在反向代理（nginx、Caddy）后绑定 `127.0.0.1`，由反向代理提供 HTTPS 和身份认证。
+- **禁止**直接暴露到公网或配置路由器端口转发。
+
+## 使用 systemd 后台运行（可选）
+
+手工启动（`python -m fullpcr gui`）仍然有效，systemd 方式适合让服务在后台长期运行、失败后自动重启、开机自启。
+
+以下命令必须在目标 Linux 服务器上由管理员执行，不要在当前开发机器上运行。
+
+### 1. 创建 fullpcr 系统用户
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin fullpcr
+```
+
+### 2. 安装项目到 /opt/fullpcr
+
+`/path/to/fullpcr` 是管理员提前上传或克隆到服务器的源码目录。
+
+```bash
+# 创建 root 管理的安装目录
+sudo install -d -o root -g root -m 0755 /opt/fullpcr
+
+# 创建虚拟环境，从源码目录进行非 editable 安装
+sudo python3 -m venv /opt/fullpcr/.venv
+sudo /opt/fullpcr/.venv/bin/pip install "/path/to/fullpcr[gui]"
+```
+
+### 3. 创建数据目录
+
+```bash
+sudo mkdir -p /srv/fullpcr/data
+sudo chown fullpcr:fullpcr /srv/fullpcr/data
+```
+
+### 4. 配置环境变量
+
+```bash
+sudo mkdir -p /etc/fullpcr
+sudo cp /path/to/fullpcr/deploy/systemd/fullpcr.env.example /etc/fullpcr/fullpcr.env
+sudo chown root:fullpcr /etc/fullpcr/fullpcr.env
+sudo chmod 640 /etc/fullpcr/fullpcr.env
+```
+
+编辑 `/etc/fullpcr/fullpcr.env`，按实际安装位置调整：
+
+- `FULLPCR_HOST` — 默认 `127.0.0.1`，适合在反向代理后运行。仅在可信内网直连时改为 `0.0.0.0`。
+- `PATH` — 确认 `.venv/bin` 路径正确，并包含 `obipcr` 和 `mfeprimer` 所在目录。
+
+### 5. 安装并启用服务
+
+```bash
+sudo cp /path/to/fullpcr/deploy/systemd/fullpcr.service /etc/systemd/system/fullpcr.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now fullpcr
+```
+
+### 6. 日常管理
+
+```bash
+sudo systemctl status fullpcr          # 查看运行状态
+sudo journalctl -u fullpcr -f          # 实时日志
+sudo systemctl stop fullpcr            # 停止服务
+sudo systemctl restart fullpcr         # 修改 env 后重启生效
+```
+
+### 重要安全提示
+
+- 当前服务**没有登录认证和 TLS 加密**。
+- 默认 `127.0.0.1` 仅本机可访问，适合在反向代理后运行。
+- 仅在可信内网且无反向代理时改为 `0.0.0.0`。
+- **禁止**直接暴露到公网。
+- `obipcr` 和 `mfeprimer` 必须能被 `fullpcr` 服务用户通过 `PATH` 找到。
+
+### 部署后验收清单
+
+部署完成后，按以下步骤验证环境：
+
+**1. 运行环境检查**
+
+```bash
+python -c "import fullpcr; print(fullpcr.__file__)"
+streamlit version
+command -v obipcr && obipcr --version
+command -v mfeprimer && mfeprimer version
+```
+
+**2. 数据目录**
+
+- 路径存在且为目录。
+- 运行用户可读写。
+- `FULLPCR_DATA_DIR` 或 `--data-dir` 指向正确路径。
+
+**3. HTTP 检查**
+
+```bash
+# 健康检查
+curl http://127.0.0.1:<port>/_stcore/health
+# 预期输出: ok
+
+# 首页
+curl -o /dev/null -w "%{http_code}" http://127.0.0.1:<port>/
+# 预期输出: 200
+```
+
+**4. 安全检查**
+
+- 默认绑定 `127.0.0.1`（非 `0.0.0.0`）。
+- 仅在可信内网直连且无反向代理时使用 `0.0.0.0`。
+- 未暴露到公网。
+- 当前版本无内置认证和 TLS，禁止公网直连。
+
+**5. 外部工具可用性**
+
+| 工具 | 验收 |
+|------|------|
+| obipcr | 已在 PATH 且可执行 |
+| mfeprimer | 已在 PATH 且可执行 |
+
+> **重要**：health 检查返回 `ok` 只证明 Web 服务正常。只有 obipcr 和 mfeprimer 均可用并完成一次真实完整的五步分析后，才能确认完整分析环境可用。
 
 ## 已知限制
 
