@@ -12,30 +12,62 @@ Batch in silico PCR analysis tool using OBITools4 `obipcr` + MFEprimer QC.
 
 - **Python** >= 3.10
 - **OBITools4** — `obipcr` 必须在 PATH 中可用
-- **MFEprimer** — `mfeprimer` v4.2.4 或兼容版本必须在 PATH 中可用，用于 thermo、dimer、hairpin、degen 和 spec
+- **MFEprimer** — `mfeprimer` v4.2.4 必须在 PATH 中可用，用于 thermo、dimer、hairpin、degen 和 spec
 
-### 安装 OBITools4
+## 推荐部署（v0.1.0）
+
+新 Linux/WSL 机器推荐使用 Conda/Mamba，并部署不可变标签 `v0.1.0`。完整命令、MFEprimer 官方二进制 SHA256、局域网访问、systemd、迁移、升级和回滚说明见 **[DEPLOYMENT.md](DEPLOYMENT.md)**。
+
+已验证的参考环境：
+
+| 组件 | 版本 |
+|---|---:|
+| fullpcr | 0.1.0 / `v0.1.0` |
+| Python | 3.13.14 |
+| OBITools4 | 4.4.46 |
+| MFEprimer | 4.2.4 |
+| Streamlit | 1.59.1 |
+| pandas | 3.0.3 |
+
+> MFEprimer 4.3.1 会改变索引及 Spec TSV 格式，当前 `v0.1.0` 不支持。不要因为环境指示为绿色就跳过实际版本检查和五步分析验收。
+
+最短安装路径如下；MFEprimer 4.2.4 必须按部署手册下载并校验后再启动：
 
 ```bash
-mamba create -n obitools4 -c conda-forge -c bioconda obitools4 -y
-conda activate obitools4
-obipcr --help
-```
-
-### 安装 MFEprimer
-
-```bash
-# 安装后验证
-mfeprimer -h
-mfeprimer version
-```
-
-### 安装 fullpcr
-
-```bash
+git clone https://github.com/ala-Lisa/fullpcr.git
 cd fullpcr
-pip install -e ".[dev]"
+git checkout v0.1.0
+
+mamba create -n fullpcr -c conda-forge -c bioconda \
+  python=3.13.14 obitools4=4.4.46 pip -y
+conda activate fullpcr
+
+# 按 DEPLOYMENT.md 安装并校验 MFEprimer 4.2.4
+python -m pip install "streamlit==1.59.1" "pandas==3.0.3"
+python -m pip install --no-deps .
 ```
+
+本机启动：
+
+```bash
+mkdir -p "$HOME/fullpcr-data"
+python -m fullpcr gui \
+  --host 127.0.0.1 --port 8501 \
+  --data-dir "$HOME/fullpcr-data"
+```
+
+可信局域网启动时，将 host 改为 `0.0.0.0`，同事通过 `http://<服务器真实-LAN-IP>:8501` 访问；不要把 `0.0.0.0` 当作浏览器地址。
+
+部署完成后至少检查：
+
+```bash
+python --version
+obipcr --version
+mfeprimer version
+curl -fsS http://127.0.0.1:8501/_stcore/health
+```
+
+health 返回 `ok` 只代表 Web 服务可用；仍须完成一次真实完整分析。开发安装可使用 `pip install -e ".[dev,gui]"`，不要与生产环境混用。
 
 ## 完整工作流
 
@@ -554,9 +586,11 @@ The header bar includes an **environment popover** (🟢/🔴 indicator) showing
 3. **结果总览** — review primer rankings, scores, and status breakdowns
 4. **报告与下载** — read the final evaluation report and obipcr report, download as needed
 
-## 迁移到 Linux / 公司内部服务器
+## 迁移到 Linux / 公司内部服务器（venv 可选方案）
 
 以下步骤适用于将 fullpcr 部署到一台干净的 Linux 服务器（如 Ubuntu 22.04/24.04、CentOS Stream 9、Rocky Linux 9）。
+
+新部署优先使用 [DEPLOYMENT.md](DEPLOYMENT.md) 中的固定版本 Conda/Mamba 方案。本节保留 `venv + systemd` 作为公司服务器的可选方案。
 
 ### 环境要求
 
