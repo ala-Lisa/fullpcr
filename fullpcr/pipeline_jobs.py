@@ -9,6 +9,7 @@ import stat
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -446,6 +447,7 @@ def _run_job(
             "status": "FAIL",
             "outcome": None,
             "error": f"后台分析任务异常: {exc}",
+            "traceback": traceback.format_exc(),
         }
     finally:
         with _REGISTRY_LOCK:
@@ -625,6 +627,7 @@ def start_pipeline_job(
             "progress_total": len(plan),
             "outcome": None,
             "error": "",
+            "traceback": "",
             "started_at": started_at,
             "step_started_at": None,
             "step_timings": {},
@@ -658,6 +661,7 @@ def start_pipeline_job(
                     "status": "FAIL",
                     "phase": "finished",
                     "error": f"无法启动后台分析任务: {exc}",
+                    "traceback": "",
                     "finished_at": _now(),
                     "updated_at": _now(),
                 }

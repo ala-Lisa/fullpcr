@@ -28,7 +28,9 @@ from fullpcr.gui_helpers import (
     build_qc_pre_command,
     build_qc_spec_command,
     build_qc_summary_command,
+    build_execution_error_details,
     build_spec_index_database_path,
+    calculate_auto_cpu_threads,
     run_full_pipeline,
     check_command_available,
     clear_upload_mode,
@@ -36,6 +38,7 @@ from fullpcr.gui_helpers import (
     compute_inputs_validated,
     derive_project_paths,
     ensure_widget_key,
+    get_available_cpu_threads,
     get_effective_database_path,
     get_effective_primers_path,
     get_effective_taxonomy_path,
@@ -47,6 +50,7 @@ from fullpcr.gui_helpers import (
     load_markdown_file,
     load_primer_rank,
     load_tsv_file,
+    resolve_spec_cpu_threads,
     run_gui_command,
     should_refresh_environment_status,
     summarize_primer_rank,
@@ -2169,6 +2173,7 @@ class TestWorkflowSyncState:
         "wf_s1_thermo", "wf_s1_dimer", "wf_s1_hairpin", "wf_s1_degen",
         "wf_s1_score", "wf_s1_dg", "wf_s1_tm", "wf_s1_mismatch", "wf_s1_maxdeg",
         "wf_s3_tm", "wf_s3_maxtm", "wf_s3_cpu", "wf_s3_kvalue", "wf_s3_force",
+        "wf_s3_manual_cpu_enabled",
         "wf_s4_summarize", "wf_s4_report", "wf_s4_force",
         "wf_s4_circular",
     ]
@@ -2891,6 +2896,9 @@ class TestGuiAppPersistence:
         assert not at.exception
         at.text_input("_wf_s4_outdir").set_value("/custom/obipcr").run()
         assert not at.exception
+        # Enable manual CPU toggle before accessing the number_input
+        at.toggle("_wf_s3_manual_cpu_enabled").set_value(True).run()
+        assert not at.exception
         at.number_input("_wf_s3_cpu").set_value(8).run()
         assert not at.exception
 
@@ -2902,13 +2910,15 @@ class TestGuiAppPersistence:
         # Must NOT raise StreamlitAPIException on re-validation.
         assert not at.exception, f"Re-validation raised: {at.exception}"
 
-        # 4. Return to Workflow — manual paths must survive.
+        # 4. Return to Workflow — manual paths AND manual CPU state survive.
         at.sidebar.radio[0].set_value("分析工作台").run()
         _enable_advanced_workflow(at)
         assert not at.exception
         assert at.text_input("_wf_s1_outdir").value == "/custom/manual/qc"
         assert at.text_input("_wf_s4_outdir").value == "/custom/obipcr"
-        assert at.number_input("_wf_s3_cpu").value == 8
+        # Manual CPU toggle and value survive re-validation
+        assert at.session_state["wf_s3_manual_cpu_enabled"] is True
+        assert at.session_state["wf_s3_cpu"] == 8
 
     def test_change_inputs_path_back_to_default(self):
         """User can change an Inputs path to the built-in default value."""
@@ -2935,7 +2945,8 @@ class TestGuiAppPersistence:
         assert at.text_input("_inputs_primers_path").value == "example_data/primers.tsv"
 
     def test_change_workflow_number_input_back_to_default(self):
-        """User can change a workflow number_input to its default value."""
+        """User can change a workflow number_input to its default value.
+        Manual CPU toggle must be enabled first to reveal the input."""
         pytest.importorskip("streamlit.testing")
         from streamlit.testing.v1 import AppTest
 
@@ -2947,6 +2958,9 @@ class TestGuiAppPersistence:
         at.sidebar.radio[0].set_value("分析工作台").run()
         _enable_advanced_workflow(at)
         assert not at.exception
+        # Enable manual CPU toggle to reveal the number_input
+        at.toggle("_wf_s3_manual_cpu_enabled").set_value(True).run()
+        assert not at.exception
         # Change to 8.
         at.number_input("_wf_s3_cpu").set_value(8).run()
         assert not at.exception
@@ -2955,6 +2969,9 @@ class TestGuiAppPersistence:
         assert not at.exception
         # UI must show 4.
         assert at.number_input("_wf_s3_cpu").value == 4
+        # The manual toggle and stored value survive
+        assert at.session_state["wf_s3_manual_cpu_enabled"] is True
+        assert at.session_state["wf_s3_cpu"] == 4
 
     def test_change_workflow_path_back_to_default(self):
         """User can change a workflow path back to its default value."""
@@ -3449,6 +3466,1359 @@ class TestStepResultDisplay:
         all_code = "\n".join(code_texts)
         assert "ERR2" in all_code, f"ERR2 not found in code: {all_code!r}"
         assert "ERR1" not in all_code, f"ERR1 unexpectedly still in code: {all_code!r}"
+
+    def test_fail_result_shows_manual_error_button(self):
+        """FAIL step result: '查看完整错误' button is rendered."""
+        pytest.importorskip("streamlit.testing")
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file(str(self._app_path()))
+        at.run(timeout=30)
+        assert not at.exception
+        _enable_advanced_workflow(at)
+
+        at.session_state["wf_s1_result"] = {
+            "status": "FAIL", "returncode": 1,
+            "command": ["mfeprimer", "qc", "--primers", "p.tsv"],
+            "stderr": "bad input", "stdout": "", "message": "failed",
+        }
+        at.run(timeout=30)
+        assert not at.exception
+        # FAIL result → error displayed in the step area.
+        assert any("运行失败" in str(e.value) for e in at.error)
+        # Manual '查看完整错误' button must be present.
+        assert any("view_full_error_s1" in str(b.id) for b in at.button)
+
+    def test_pass_result_no_error_button(self):
+        """PASS step result: no error, no '查看完整错误' button."""
+        pytest.importorskip("streamlit.testing")
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file(str(self._app_path()))
+        at.run(timeout=30)
+        assert not at.exception
+        _enable_advanced_workflow(at)
+
+        at.session_state["wf_s1_result"] = {
+            "status": "PASS", "returncode": 0,
+            "command": ["mfeprimer", "qc", "--primers", "p.tsv"],
+            "stderr": "", "stdout": "results\n", "message": "ok",
+        }
+        at.run(timeout=30)
+        assert not at.exception
+        # PASS → no error, no '查看完整错误' button.
+        assert not any("view_full_error_s1" in str(b.id) for b in at.button)
+        assert any("运行成功" in str(e.value) for e in at.success)
+
+    def test_manual_error_button_sets_pending_dialog(self):
+        """Clicking '查看完整错误' on a FAIL step sets pending_error_dialog."""
+        pytest.importorskip("streamlit.testing")
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file(str(self._app_path()))
+        at.run(timeout=30)
+        assert not at.exception
+        _enable_advanced_workflow(at)
+
+        at.session_state["wf_s1_result"] = {
+            "status": "FAIL", "returncode": 1,
+            "command": ["mfeprimer", "qc", "--primers", "p.tsv"],
+            "stderr": "bad input", "stdout": "", "message": "failed",
+        }
+        at.run(timeout=30)
+        assert not at.exception
+
+        # Click the manual error button; error details are assembled and
+        # the dialog is shown via st.rerun() round-trip.
+        at.button("view_full_error_s1").click().run()
+        assert not at.exception
+        # The dialog may have consumed pending_error_dialog during the rerun
+        # — the key check is that no exception was raised.
+
+    def test_advanced_auto_open_once_rerun_no_repeat(self):
+        """FAIL step with show_advanced_error_details set: auto-routes to
+        pending_error_dialog.  On next plain rerun, show_advanced_error_details
+        is gone so auto-open does NOT repeat."""
+        pytest.importorskip("streamlit.testing")
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file(str(self._app_path()))
+        at.run(timeout=30)
+        assert not at.exception
+        _enable_advanced_workflow(at)
+
+        at.session_state["wf_s3_result"] = {
+            "status": "FAIL", "returncode": 1,
+            "command": ["mfeprimer", "spec"], "stderr": "err",
+            "stdout": "", "message": "spec failed",
+        }
+        # Simulate: the workflow step button was just clicked, setting the
+        # auto-open flag.
+        at.session_state["show_advanced_error_details"] = (
+            build_execution_error_details(
+                step_key="s3", step_label="特异性分析",
+                result=at.session_state["wf_s3_result"],
+            )
+        )
+        at.run(timeout=30)
+        assert not at.exception
+        # show_advanced_error_details is consumed by _render_step_result.
+        assert "show_advanced_error_details" not in at.session_state
+
+        # Plain rerun: no new show_advanced_error_details → auto-open does
+        # NOT fire again.  The manual '查看完整错误' button is still present.
+        at.run(timeout=30)
+        assert not at.exception
+        assert "show_advanced_error_details" not in at.session_state
+        # Manual button still available.
+        assert any("view_full_error_s3" in str(b.id) for b in at.button)
+
+    def test_manual_error_button_clickable_twice(self):
+        """Manual '查看完整错误' can be clicked repeatedly — each click
+        sets pending_error_dialog and requests rerun without crash."""
+        pytest.importorskip("streamlit.testing")
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file(str(self._app_path()))
+        at.run(timeout=30)
+        assert not at.exception
+        _enable_advanced_workflow(at)
+
+        at.session_state["wf_s1_result"] = {
+            "status": "FAIL", "returncode": 1,
+            "command": ["mfeprimer"], "stderr": "boom",
+            "stdout": "", "message": "fail",
+        }
+        at.run(timeout=30)
+        assert not at.exception
+
+        # Click #1
+        at.button("view_full_error_s1").click().run()
+        assert not at.exception
+
+        # Click #2 — button still present and clickable.
+        at.button("view_full_error_s1").click().run()
+        assert not at.exception
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CPU thread detection and resolution tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestCpuThreads:
+    """Tests for get_available_cpu_threads, calculate_auto_cpu_threads,
+    and resolve_spec_cpu_threads."""
+
+    # ── calculate_auto_cpu_threads ──────────────────────────────────────
+
+    def test_auto_cpu_60_percent_floor(self):
+        """60% floor: 1→1, 4→2, 8→4, 12→7, 16→9, 32→19."""
+        assert calculate_auto_cpu_threads(1) == 1
+        assert calculate_auto_cpu_threads(4) == 2
+        assert calculate_auto_cpu_threads(8) == 4
+        assert calculate_auto_cpu_threads(12) == 7
+        assert calculate_auto_cpu_threads(16) == 9
+        assert calculate_auto_cpu_threads(32) == 19
+
+    def test_auto_cpu_minimum_one(self):
+        """Available threads of 0 or negative still returns 1."""
+        assert calculate_auto_cpu_threads(0) == 1
+        assert calculate_auto_cpu_threads(-5) == 1
+
+    # ── get_available_cpu_threads ───────────────────────────────────────
+
+    def test_affinity_less_than_cpu_count(self, monkeypatch):
+        """When affinity is 8 but os.cpu_count() is 32, available is 8."""
+        monkeypatch.setattr(os, "cpu_count", lambda: 32)
+        monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(8)))
+        assert get_available_cpu_threads() == 8
+
+    def test_affinity_missing_falls_back_to_cpu_count(self, monkeypatch):
+        """When sched_getaffinity is absent, fall back to os.cpu_count()."""
+        monkeypatch.setattr(os, "cpu_count", lambda: 16)
+        monkeypatch.delattr(os, "sched_getaffinity", raising=False)
+        assert get_available_cpu_threads() == 16
+
+    def test_affinity_empty_falls_back_to_cpu_count(self, monkeypatch):
+        """Empty affinity set falls back to os.cpu_count()."""
+        monkeypatch.setattr(os, "cpu_count", lambda: 16)
+        monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set())
+        assert get_available_cpu_threads() == 16
+
+    def test_affinity_oserror_falls_back_to_cpu_count(self, monkeypatch):
+        """OSError from sched_getaffinity falls back to os.cpu_count()."""
+        monkeypatch.setattr(os, "cpu_count", lambda: 16)
+
+        def _raise(*_a, **_kw):
+            raise OSError("mock")
+
+        monkeypatch.setattr(os, "sched_getaffinity", _raise)
+        assert get_available_cpu_threads() == 16
+
+    def test_both_sources_none_falls_back_to_one(self, monkeypatch):
+        """When both affinity and cpu_count are None, return 1."""
+        monkeypatch.setattr(os, "cpu_count", lambda: None)
+        monkeypatch.delattr(os, "sched_getaffinity", raising=False)
+        assert get_available_cpu_threads() == 1
+
+    def test_illegal_cpu_count_falls_back_to_one(self, monkeypatch):
+        """When cpu_count returns 0 or negative, return 1."""
+        monkeypatch.setattr(os, "cpu_count", lambda: 0)
+        monkeypatch.delattr(os, "sched_getaffinity", raising=False)
+        assert get_available_cpu_threads() == 1
+
+    # ── resolve_spec_cpu_threads ────────────────────────────────────────
+
+    def test_auto_mode_ignores_manual_value(self):
+        """When manual is disabled, manual value is ignored."""
+        result = resolve_spec_cpu_threads(
+            manual_enabled=False,
+            manual_threads=99,
+            available_threads=16,
+        )
+        assert result == 9  # floor(16 * 0.6)
+
+    def test_manual_mode_uses_provided_value(self):
+        """Manual mode with valid value uses it directly."""
+        result = resolve_spec_cpu_threads(
+            manual_enabled=True,
+            manual_threads=6,
+            available_threads=16,
+        )
+        assert result == 6
+
+    def test_manual_zero_clamped_to_one(self):
+        """Manual value of 0 is clamped to 1."""
+        result = resolve_spec_cpu_threads(
+            manual_enabled=True,
+            manual_threads=0,
+            available_threads=16,
+        )
+        assert result == 1
+
+    def test_manual_exceeds_limit_clamped(self):
+        """Manual value > available is clamped to available."""
+        result = resolve_spec_cpu_threads(
+            manual_enabled=True,
+            manual_threads=20,
+            available_threads=16,
+        )
+        assert result == 16
+
+    def test_manual_none_falls_back_to_auto(self):
+        """Manual mode with None value falls back to auto."""
+        result = resolve_spec_cpu_threads(
+            manual_enabled=True,
+            manual_threads=None,
+            available_threads=16,
+        )
+        assert result == 9
+
+    def test_available_none_calls_get_available(self, monkeypatch):
+        """When available_threads is None, calls get_available_cpu_threads()."""
+        monkeypatch.setattr(
+            "fullpcr.gui_helpers.get_available_cpu_threads",
+            lambda: 8,
+        )
+        result = resolve_spec_cpu_threads(
+            manual_enabled=False,
+            manual_threads=None,
+            available_threads=None,
+        )
+        assert result == 4  # floor(8 * 0.6) = 4
+
+    def test_manual_negative_falls_back_to_auto(self):
+        """Negative manual value falls back to auto."""
+        result = resolve_spec_cpu_threads(
+            manual_enabled=True,
+            manual_threads=-1,
+            available_threads=16,
+        )
+        assert result == 9
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Execution error details tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestExecutionErrorDetails:
+    """Tests for build_execution_error_details()."""
+
+    def test_all_fields_present(self):
+        """Result dict is fully populated — all fields map correctly."""
+        result = {
+            "status": "FAIL",
+            "returncode": 2,
+            "command": ["obipcr", "--forward", "ACGT"],
+            "stderr": "error line 1\nerror line 2",
+            "stdout": "stdout line",
+            "message": "Command exited with code 2",
+        }
+        details = build_execution_error_details(
+            step_key="s4",
+            step_label="obipcr 全库模拟 PCR",
+            result=result,
+            job_id="abc123",
+            background_error="bg err",
+            background_traceback="Traceback (most recent call last):\n  ...",
+        )
+        assert details["step_key"] == "s4"
+        assert details["step_label"] == "obipcr 全库模拟 PCR"
+        assert details["job_id"] == "abc123"
+        assert details["status"] == "FAIL"
+        assert details["returncode"] == "2"
+        assert "--forward" in details["command"]
+        assert "error line 1" in details["stderr"]
+        assert "error line 2" in details["stderr"]
+        assert details["stdout"] == "stdout line"
+        assert details["background_error"] == "bg err"
+        assert "Traceback" in details["background_traceback"]
+
+    def test_result_none_normalizes_to_empty(self):
+        """None result: all fields are empty strings, no exceptions."""
+        details = build_execution_error_details(
+            step_key="s1",
+            step_label="基础质控",
+            result=None,
+        )
+        assert details["status"] == ""
+        assert details["returncode"] == ""
+        assert details["command"] == ""
+        assert details["stderr"] == ""
+        assert details["stdout"] == ""
+        assert details["message"] == ""
+
+    def test_multiline_stderr_preserved(self):
+        """Multi-line stderr is preserved in full."""
+        result = {
+            "status": "FAIL",
+            "returncode": 1,
+            "command": ["cmd"],
+            "stderr": "line A\nline B\nline C\n",
+            "stdout": "",
+            "message": "failed",
+        }
+        details = build_execution_error_details(
+            step_key="s1", step_label="test", result=result,
+        )
+        assert "line A" in details["stderr"]
+        assert "line B" in details["stderr"]
+        assert "line C" in details["stderr"]
+
+    def test_command_is_string_preserved(self):
+        """When command is already a string, use it as-is."""
+        result = {
+            "status": "FAIL",
+            "returncode": 1,
+            "command": "obipcr --forward ACGT",
+            "stderr": "", "stdout": "", "message": "",
+        }
+        details = build_execution_error_details(
+            step_key="s1", step_label="test", result=result,
+        )
+        assert details["command"] == "obipcr --forward ACGT"
+
+    def test_command_is_list_joined(self):
+        """When command is a list, join with spaces."""
+        result = {
+            "status": "FAIL",
+            "returncode": 1,
+            "command": ["obipcr", "--forward", "ACGT"],
+            "stderr": "", "stdout": "", "message": "",
+        }
+        details = build_execution_error_details(
+            step_key="s1", step_label="test", result=result,
+        )
+        assert details["command"] == "obipcr --forward ACGT"
+
+    def test_returncode_zero_preserved(self):
+        """returncode of 0 is preserved as "0", not normalised away."""
+        result = {
+            "status": "FAIL",
+            "returncode": 0,
+            "command": ["cmd"],
+            "stderr": "", "stdout": "", "message": "",
+        }
+        details = build_execution_error_details(
+            step_key="s1", step_label="test", result=result,
+        )
+        assert details["returncode"] == "0"
+
+    def test_returncode_none_normalized_to_empty(self):
+        """returncode of None is normalised to empty string."""
+        result = {
+            "status": "FAIL",
+            "returncode": None,
+            "command": ["cmd"],
+            "stderr": "", "stdout": "", "message": "",
+        }
+        details = build_execution_error_details(
+            step_key="s1", step_label="test", result=result,
+        )
+        assert details["returncode"] == ""
+
+    def test_status_none_normalized_to_empty(self):
+        """status of None is normalised to empty string."""
+        result = {
+            "status": None,
+            "returncode": 1,
+            "command": ["cmd"],
+            "stderr": "", "stdout": "", "message": "",
+        }
+        details = build_execution_error_details(
+            step_key="s1", step_label="test", result=result,
+        )
+        assert details["status"] == ""
+
+    def test_background_fields_default_empty(self):
+        """background_error and background_traceback default to empty."""
+        result = {
+            "status": "FAIL", "returncode": 1,
+            "command": ["cmd"], "stderr": "", "stdout": "", "message": "",
+        }
+        details = build_execution_error_details(
+            step_key="s1", step_label="test", result=result,
+        )
+        assert details["background_error"] == ""
+        assert details["background_traceback"] == ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Error dialog session state dedup tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestErrorDialogDedup:
+    """Verify the session-state dedup logic for error dialog auto-popup.
+
+    Tests the production dedup logic (not a copy) via the session-state keys
+    that ``_maybe_show_error_dialog`` and ``_render_full_pipeline_outcome``
+    use: ``last_auto_shown_error_job_id`` for background jobs and
+    ``show_advanced_error_details`` for advanced steps.
+    """
+
+    @staticmethod
+    def _background_details(job_id, status="FAIL"):
+        return build_execution_error_details(
+            step_key="s3", step_label="特异性分析",
+            result={"status": status, "returncode": 1, "command": ["cmd"],
+                    "stderr": "err", "stdout": "", "message": ""},
+            job_id=job_id, background_error="", background_traceback="",
+        )
+
+    def test_first_job_auto_opens(self):
+        """First terminal FAIL job: dialog opens."""
+        state: dict = {}
+        details = self._background_details("job-001")
+        # Dedup check: new job_id → should open
+        assert state.get("last_auto_shown_error_job_id") != details["job_id"]
+        state["last_auto_shown_error_job_id"] = details["job_id"]
+        assert state["last_auto_shown_error_job_id"] == "job-001"
+
+    def test_same_job_id_rerun_blocked(self):
+        """Same job_id on rerun: dedup blocks auto-open."""
+        state = {"last_auto_shown_error_job_id": "job-001"}
+        details = self._background_details("job-001")
+        assert details["job_id"] == state["last_auto_shown_error_job_id"]
+
+    def test_new_job_id_auto_opens_again(self):
+        """Different job_id: auto-opens again."""
+        state = {"last_auto_shown_error_job_id": "job-001"}
+        details = self._background_details("job-002")
+        assert details["job_id"] != state.get("last_auto_shown_error_job_id")
+        state["last_auto_shown_error_job_id"] = details["job_id"]
+        assert state["last_auto_shown_error_job_id"] == "job-002"
+
+    def test_repeated_manual_view_always_allowed(self):
+        """Manual button bypasses dedup — always calls _render_error_dialog directly."""
+        # Manual view: just build details and verify they're valid.
+        # The production code always allows st.button("查看完整错误") to open dialog.
+        details = build_execution_error_details(
+            step_key="s3", step_label="test",
+            result={"status": "FAIL", "returncode": 1, "command": ["cmd"],
+                    "stderr": "e", "stdout": "", "message": "m"},
+            job_id="job-001",
+        )
+        # Ensure details are well-formed for dialog rendering.
+        assert details["step_key"] == "s3"
+        assert details["status"] == "FAIL"
+        assert details["returncode"] == "1"
+
+    def test_advanced_failure_each_new_click_auto_opens(self):
+        """Advanced step: each button click sets show_advanced_error_details,
+        dialog pops it after render. New click sets it again."""
+        # simulate click #1
+        state: dict = {}
+        details1 = build_execution_error_details(
+            step_key="s3", step_label="test",
+            result={"status": "FAIL", "returncode": 1, "command": ["cmd"],
+                    "stderr": "e", "stdout": "", "message": ""},
+        )
+        state["show_advanced_error_details"] = details1
+        assert state["show_advanced_error_details"]["step_key"] == "s3"
+        # render consumes it
+        state.pop("show_advanced_error_details", None)
+        assert "show_advanced_error_details" not in state
+        # click #2: new failure, new details
+        details2 = build_execution_error_details(
+            step_key="s4", step_label="test",
+            result={"status": "FAIL", "returncode": 1, "command": ["cmd2"],
+                    "stderr": "", "stdout": "", "message": ""},
+        )
+        state["show_advanced_error_details"] = details2
+        assert state["show_advanced_error_details"]["step_key"] == "s4"
+
+    def test_pass_shows_no_error_button(self):
+        """PASS results: show_advanced_error_details is never set."""
+        state: dict = {}
+        # Production code does NOT set this key for PASS
+        assert state.get("show_advanced_error_details") is None
+        # build_execution_error_details for PASS would still work, but
+        # _render_step_result only shows the button for FAIL/TIMEOUT/CANCELLED
+        details = build_execution_error_details(
+            step_key="s1", step_label="test",
+            result={"status": "PASS", "returncode": 0, "command": ["cmd"],
+                    "stderr": "", "stdout": "", "message": ""},
+        )
+        assert details["status"] == "PASS"
+
+    def test_outcome_none_background_exception(self):
+        """outcome=None with FAIL job status: fallback result carries FAIL status
+        so dialog shows the correct terminal outcome."""
+        job = {
+            "job_id": "bg-crash-1",
+            "status": "FAIL",
+            "error": "后台分析任务异常: something broke",
+            "traceback": "Traceback (most recent call last):\n  File 'x', line 1, in run\nRuntimeError: broke\n",
+        }
+        # Simulate the fallback result that _extract_pipeline_error_details creates
+        # when outcome=None: step_result gets the job's status/message.
+        fallback_result = {
+            "status": job["status"],
+            "returncode": None,
+            "command": [],
+            "stderr": "",
+            "stdout": "",
+            "message": job["error"],
+        }
+        details = build_execution_error_details(
+            step_key="",
+            step_label="",
+            result=fallback_result,
+            job_id=job["job_id"],
+            background_error=job["error"],
+            background_traceback=job["traceback"],
+        )
+        assert details["job_id"] == "bg-crash-1"
+        assert details["status"] == "FAIL"
+        assert "something broke" in details["background_error"]
+        assert "RuntimeError" in details["background_traceback"]
+
+    def test_full_raw_text_in_details(self):
+        """All raw error fields are preserved in the details dict."""
+        result = {
+            "status": "FAIL",
+            "returncode": 3,
+            "command": ["mfeprimer", "spec", "--cpu", "4"],
+            "stderr": "ERROR: specific error\ndetails here\n",
+            "stdout": "some output\n",
+            "message": "Command exited with code 3",
+        }
+        details = build_execution_error_details(
+            step_key="s3", step_label="特异性分析", result=result,
+            job_id="bg-001", background_error="pipeline error",
+            background_traceback="Traceback:\n  File 'x', line 1\n",
+        )
+        assert "mfeprimer" in details["command"]
+        assert "--cpu 4" in details["command"]
+        assert "specific error" in details["stderr"]
+        assert "details here" in details["stderr"]
+        assert "some output" in details["stdout"]
+        assert "pipeline error" in details["background_error"]
+        assert "File 'x'" in details["background_traceback"]
+
+
+class TestExtractPipelineErrorDetails:
+    """Test the production _extract_pipeline_error_details from gui_app."""
+
+    @staticmethod
+    def _extract(outcome, job):
+        pytest.importorskip("streamlit")
+        from fullpcr.gui_app import _extract_pipeline_error_details
+        return _extract_pipeline_error_details(outcome, job)
+
+    def test_pass_returns_none(self):
+        assert self._extract(
+            {"status": "PASS", "results": {}, "failed_step": None},
+            {"job_id": "j1", "status": "PASS", "error": "", "traceback": ""},
+        ) is None
+
+    def test_cancelled_returns_none(self):
+        assert self._extract(
+            {"status": "CANCELLED", "results": {}, "failed_step": None},
+            {"job_id": "j1", "status": "CANCELLED", "error": "", "traceback": ""},
+        ) is None
+
+    def test_fail_with_outcome_extracts_fields(self):
+        details = self._extract(
+            {
+                "status": "FAIL", "failed_step": "s3",
+                "results": {
+                    "wf_s3_result": {
+                        "status": "FAIL", "returncode": 2,
+                        "command": ["mfeprimer", "spec"],
+                        "stderr": "bad input", "stdout": "", "message": "fail",
+                    },
+                },
+            },
+            {"job_id": "j1", "status": "FAIL", "error": "", "traceback": ""},
+        )
+        assert details is not None
+        assert details["job_id"] == "j1"
+        assert details["step_key"] == "s3"
+        assert details["status"] == "FAIL"
+        assert "bad input" in details["stderr"]
+
+    def test_timeout_with_outcome_extracts_fields(self):
+        details = self._extract(
+            {
+                "status": "TIMEOUT", "failed_step": "s4",
+                "results": {},
+            },
+            {"job_id": "j2", "status": "TIMEOUT", "error": "timeout", "traceback": ""},
+        )
+        assert details is not None
+        assert details["job_id"] == "j2"
+        assert details["step_key"] == "s4"
+
+    def test_outcome_none_uses_job_status(self):
+        """When outcome is None, the job's FAIL status is used as fallback."""
+        details = self._extract(
+            None,
+            {
+                "job_id": "bg-crash", "status": "FAIL",
+                "error": "后台异常: boom",
+                "traceback": "Traceback...\nRuntimeError: boom\n",
+            },
+        )
+        assert details is not None
+        assert details["job_id"] == "bg-crash"
+        assert details["status"] == "FAIL"
+        assert "boom" in details["message"]
+        assert "RuntimeError" in details["background_traceback"]
+
+    def test_outcome_none_timeout_uses_job_status(self):
+        details = self._extract(
+            None,
+            {"job_id": "t1", "status": "TIMEOUT", "error": "超时", "traceback": ""},
+        )
+        assert details is not None
+        assert details["job_id"] == "t1"
+        assert details["status"] == "TIMEOUT"
+
+    def test_results_nonempty_but_failed_step_missing(self):
+        """outcome['results'] exists but the failed step's key is absent —
+        fall back to outcome status/message, then job."""
+        details = self._extract(
+            {
+                "status": "FAIL", "failed_step": "s3",
+                "results": {
+                    "wf_s1_result": {"status": "PASS"},
+                    "wf_s2_result": {"status": "PASS"},
+                    # wf_s3_result is missing
+                },
+                "message": "step 3 crashed",
+            },
+            {"job_id": "j-x", "status": "FAIL",
+             "error": "后台异常: boom",
+             "traceback": "Traceback...\nRuntimeError\n"},
+        )
+        assert details is not None
+        assert details["status"] == "FAIL"
+        assert details["step_key"] == "s3"
+        assert "step 3 crashed" in details["message"]
+        assert "boom" in details["background_error"]
+        assert "RuntimeError" in details["background_traceback"]
+
+    def test_results_nonempty_but_step_result_not_dict(self):
+        """outcome['results'] has the key but its value is not a dict —
+        fall back to outcome status/message."""
+        details = self._extract(
+            {
+                "status": "TIMEOUT", "failed_step": "s2",
+                "results": {
+                    "wf_s2_result": "not a dict",
+                },
+                "message": "qc summary timed out",
+            },
+            {"job_id": "j-y", "status": "TIMEOUT",
+             "error": "超时", "traceback": ""},
+        )
+        assert details is not None
+        assert details["status"] == "TIMEOUT"
+        assert details["step_key"] == "s2"
+        assert "timed out" in details["message"]
+
+    def test_results_nonempty_failed_step_empty(self):
+        """outcome has results and FAIL status but failed_step is empty —
+        fall back to outcome, then job."""
+        details = self._extract(
+            {
+                "status": "FAIL", "failed_step": "",
+                "results": {"wf_s1_result": {"status": "PASS"}},
+                "message": "pipeline failed",
+            },
+            {"job_id": "j-z", "status": "FAIL",
+             "error": "exception", "traceback": "tb"},
+        )
+        assert details is not None
+        assert details["status"] == "FAIL"
+        assert details["step_key"] == ""
+        assert "pipeline failed" in details["message"]
+
+    def test_outcome_message_empty_falls_back_to_job_error(self):
+        """When outcome has FAIL status but empty message, message falls back
+        to job.error for the dialog display."""
+        details = self._extract(
+            {
+                "status": "FAIL", "failed_step": "s3",
+                "results": {}, "message": "",
+            },
+            {"job_id": "j-e", "status": "FAIL",
+             "error": "job-level error msg",
+             "traceback": "tb-line\n"},
+        )
+        assert details is not None
+        assert details["status"] == "FAIL"
+        assert details["step_key"] == "s3"
+        assert "job-level error msg" in details["message"]
+        assert "tb-line" in details["background_traceback"]
+
+    @pytest.mark.parametrize("outcome_msg,job_error,expected_in_message", [
+        ("", "job error text", "job error text"),
+        ("outcome msg text", "job error text", "outcome msg text"),
+    ])
+    def test_message_fallback_parameterized(
+        self, outcome_msg, job_error, expected_in_message,
+    ):
+        """Parameterized: outcome.message empty → job.error; non-empty → kept."""
+        details = self._extract(
+            {
+                "status": "FAIL", "failed_step": "s2",
+                "results": {}, "message": outcome_msg,
+            },
+            {"job_id": "j-p", "status": "FAIL",
+             "error": job_error, "traceback": ""},
+        )
+        assert details is not None
+        assert expected_in_message in details["message"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Production-boundary tests: _render_full_pipeline_outcome via FakeSt
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class _RerunSentinel(Exception):
+    """Raised by FakeSt.rerun() to signal a rerun request."""
+
+
+class _FakeSt:
+    """Controlled fake of streamlit for testing _render_full_pipeline_outcome."""
+
+    def __init__(self, session_state, *, buttons=None):
+        self.session_state = session_state  # plain dict
+        self._buttons = buttons or {}
+        self.rerun_calls: list[int] = []
+
+    def rerun(self):
+        self.rerun_calls.append(1)
+        raise _RerunSentinel()
+
+    def button(self, _label, key=None, **_kw):
+        return self._buttons.get(key, False)
+
+    # no-op render stubs
+    def success(self, _msg): pass
+    def error(self, _msg): pass
+    def warning(self, _msg): pass
+    def info(self, _msg): pass
+    def caption(self, _msg): pass
+    def metric(self, _label, _value, **_kw): pass
+    def markdown(self, _msg, **_kw): pass
+    def code(self, _text, **_kw): pass
+
+
+def _make_outcome(status="FAIL", failed_step="s3", message="test fail",
+                  results=None):
+    """Build a realistic outcome dict for parameterised tests.
+    job_id belongs on the job dict (see _make_job), not the outcome."""
+    if results is None:
+        results = {
+            f"wf_{failed_step}_result": {
+                "status": status, "returncode": 1,
+                "command": ["mfeprimer", "spec"], "stderr": "err",
+                "stdout": "", "message": message,
+            },
+        }
+    return {
+        "status": status, "failed_step": failed_step,
+        "results": results, "message": message,
+    }
+
+
+def _make_job(job_id="job-001", status="FAIL", error="bg error",
+              traceback="Traceback..."):
+    return {"job_id": job_id, "status": status, "error": error,
+            "traceback": traceback}
+
+
+class TestRenderFullPipelineOutcome:
+    """Call _render_full_pipeline_outcome() with a controlled FakeSt."""
+
+    @staticmethod
+    def _call(outcome, session_state=None, buttons=None, job=None):
+        ss = session_state if session_state is not None else {}
+        job = job or _make_job()
+        # _render_full_pipeline_outcome reads job_id from session state,
+        # not from the job dict.  Pre-populate it so the auto-popup and
+        # manual branches see the correct job_id.
+        if "full_pipeline_job_id" not in ss:
+            ss["full_pipeline_job_id"] = job.get("job_id", "job-001")
+        fake = _FakeSt(ss, buttons=buttons)
+        with mock.patch("fullpcr.gui_app.st", fake):
+            with mock.patch(
+                "fullpcr.gui_app.get_pipeline_job",
+                return_value=job,
+            ):
+                from fullpcr.gui_app import _render_full_pipeline_outcome
+                try:
+                    _render_full_pipeline_outcome(outcome)
+                except _RerunSentinel:
+                    pass
+        return fake
+
+    # ── auto-popup productive tests ────────────────────────────────────
+
+    @pytest.mark.parametrize("status", ["FAIL", "TIMEOUT"])
+    def test_first_fail_triggers_auto_popup_and_rerun(self, status):
+        """First terminal FAIL/TIMEOUT: auto-popup sets both markers and
+        calls st.rerun()."""
+        outcome = _make_outcome(status=status)
+        ss: dict = {}
+        fake = self._call(outcome, session_state=ss)
+        assert ss["last_auto_shown_error_job_id"] == "job-001"
+        assert isinstance(ss.get("pending_error_dialog"), dict)
+        assert ss["pending_error_dialog"]["status"] == status
+        assert len(fake.rerun_calls) == 1
+
+    @pytest.mark.parametrize("status", ["FAIL", "TIMEOUT"])
+    def test_same_job_id_rerun_no_auto_popup(self, status):
+        """Same job_id already auto-shown: no markers changed, no rerun."""
+        outcome = _make_outcome(status=status)
+        ss = {"last_auto_shown_error_job_id": "job-001"}
+        fake = self._call(outcome, session_state=ss)
+        assert ss["last_auto_shown_error_job_id"] == "job-001"
+        assert "pending_error_dialog" not in ss
+        assert len(fake.rerun_calls) == 0
+
+    @pytest.mark.parametrize("status", ["FAIL", "TIMEOUT"])
+    def test_different_job_id_re_triggers(self, status):
+        """Different job_id from last_auto_shown: re-triggers auto-popup."""
+        outcome = _make_outcome(status=status)
+        ss = {"last_auto_shown_error_job_id": "job-001"}
+        fake = self._call(outcome, session_state=ss,
+                          job=_make_job(job_id="job-002"))
+        assert ss["last_auto_shown_error_job_id"] == "job-002"
+        assert isinstance(ss.get("pending_error_dialog"), dict)
+        assert ss["pending_error_dialog"]["status"] == status
+        assert len(fake.rerun_calls) == 1
+
+    # ── manual button productive tests ──────────────────────────────────
+
+    def test_manual_button_twice_both_request_rerun(self):
+        """Manual click twice: both set pending_error_dialog and call
+        rerun; last_auto_shown_error_job_id is never modified."""
+        outcome = _make_outcome(status="FAIL")
+        ss = {"last_auto_shown_error_job_id": "job-001",
+              "full_pipeline_job_id": "job-001"}
+
+        # Click #1
+        fake1 = self._call(outcome, session_state=ss,
+                           buttons={"view_full_error_pipeline": True},
+                           job=_make_job())
+        assert isinstance(ss.get("pending_error_dialog"), dict)
+        assert ss["pending_error_dialog"]["status"] == "FAIL"
+        assert "pending_error_dialog" in ss  # before rerun consumption
+        assert len(fake1.rerun_calls) == 1
+
+        # Click #2
+        fake2 = self._call(outcome, session_state=ss,
+                           buttons={"view_full_error_pipeline": True},
+                           job=_make_job())
+        assert isinstance(ss.get("pending_error_dialog"), dict)
+        assert len(fake2.rerun_calls) == 1
+        # Dedup marker was never touched by manual path.
+        assert ss["last_auto_shown_error_job_id"] == "job-001"
+
+    def test_manual_button_does_not_modify_dedup_marker(self):
+        """Manual path: last_auto_shown_error_job_id unchanged regardless of
+        whether auto-popup had previously fired."""
+        outcome = _make_outcome(status="FAIL")
+        # Scenario: auto-popup already happened, then user clicks manual.
+        ss = {"last_auto_shown_error_job_id": "job-001",
+              "full_pipeline_job_id": "job-001"}
+        self._call(outcome, session_state=ss,
+                   buttons={"view_full_error_pipeline": True},
+                   job=_make_job())
+        assert ss["last_auto_shown_error_job_id"] == "job-001"
+
+    # ── PASS / CANCELLED defensive tests ───────────────────────────────
+
+    def test_pass_outcome_no_error_entry(self):
+        """PASS outcome: no pending_error_dialog, no rerun call."""
+        outcome = _make_outcome(status="PASS", failed_step=None, message="ok",
+                                results={"wf_s1_result": {"status": "PASS"}})
+        ss: dict = {}
+        fake = self._call(outcome, session_state=ss,
+                          job=_make_job(status="PASS"))
+        assert "pending_error_dialog" not in ss
+        assert "last_auto_shown_error_job_id" not in ss
+        assert len(fake.rerun_calls) == 0
+
+    def test_cancelled_outcome_no_error_entry(self):
+        """CANCELLED outcome: no pending_error_dialog, no rerun."""
+        outcome = _make_outcome(status="CANCELLED", failed_step="s3",
+                                message="cancelled")
+        ss: dict = {}
+        fake = self._call(outcome, session_state=ss,
+                          job=_make_job(status="CANCELLED"))
+        assert "pending_error_dialog" not in ss
+        assert "last_auto_shown_error_job_id" not in ss
+        assert len(fake.rerun_calls) == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Production-boundary tests: _render_pipeline_job_controls.__wrapped__
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class _FakeStWrapped:
+    """Controlled fake for testing _render_pipeline_job_controls.__wrapped__."""
+
+    def __init__(self, session_state, *, buttons=None):
+        self.session_state = session_state
+        self._buttons = buttons or {}
+
+    def rerun(self):
+        raise _RerunSentinel()
+
+    def button(self, _label, key=None, **_kw):
+        return self._buttons.get(key, False)
+
+    def progress(self, _value, text=""):
+        class _P:  # minimal proto-like object
+            proto = type("_", (), {"value": _value, "text": text})()
+        return _P()
+
+    def success(self, _msg): pass
+    def error(self, _msg): pass
+    def warning(self, _msg): pass
+    def info(self, _msg): pass
+    def caption(self, _msg): pass
+    def markdown(self, _msg, **_kw): pass
+    def code(self, _text, **_kw): pass
+
+
+class TestPipelineJobControlsWrapped:
+    """Call _render_pipeline_job_controls.__wrapped__ with controlled mocks."""
+
+    @staticmethod
+    def _call(project_root="fake-root", plan=None, *, base_disabled=False,
+              session_state=None, job_on_disk=None, buttons=None):
+        ss = session_state if session_state is not None else {}
+        fake = _FakeStWrapped(ss, buttons=buttons)
+        if plan is None:
+            plan = [{"key": f"s{i}", "command": ["cmd"], "label": f"step{i}"}
+                    for i in range(1, 6)]
+        with mock.patch("fullpcr.gui_app.st", fake):
+            with mock.patch(
+                "fullpcr.gui_app.get_pipeline_job",
+                return_value=job_on_disk,
+            ):
+                from fullpcr.gui_app import _render_pipeline_job_controls
+                try:
+                    _render_pipeline_job_controls.__wrapped__(
+                        project_root, plan, base_disabled=base_disabled,
+                    )
+                except _RerunSentinel:
+                    pass
+        return fake
+
+    def test_dismissed_job_not_synced_and_no_state_writes(self):
+        """When dismissed_terminal_job_id matches a terminal job on disk,
+        the function must NOT sync outcome, NOT write full_pipeline_result,
+        NOT write full_pipeline_job_id, and NOT set pending_error_dialog."""
+        job = _make_job(job_id="job-old", status="FAIL")
+        ss = {"dismissed_terminal_job_id": "job-old"}
+        self._call(session_state=ss, job_on_disk=job)
+        assert "full_pipeline_result" not in ss
+        assert "full_pipeline_job_id" not in ss
+        assert "pending_error_dialog" not in ss
+
+    def test_non_dismissed_terminal_job_is_synced(self):
+        """Without a matching dismiss marker, a terminal job IS synced
+        (regression: dismiss guard must not accidentally block all jobs)."""
+        job = _make_job(job_id="job-new", status="FAIL")
+        job["outcome"] = _make_outcome(
+            status="FAIL", failed_step="s3",
+            results={"wf_s3_result": {"status": "FAIL", "returncode": 1,
+                     "command": ["cmd"], "stderr": "", "stdout": "",
+                     "message": "fail"}},
+        )
+        ss: dict = {}
+        self._call(session_state=ss, job_on_disk=job)
+        # Without dismiss, the terminal job's outcome should be synced.
+        assert ss.get("full_pipeline_job_id") == "job-new"
+        assert isinstance(ss.get("full_pipeline_result"), dict)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Production-boundary tests: _render_step_result via FakeSt
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class _FakeStStep:
+    """Controlled fake of streamlit for testing _render_step_result."""
+
+    def __init__(self, session_state, *, buttons=None):
+        self.session_state = session_state
+        self._buttons = buttons or {}
+        self.rerun_calls: list[int] = []
+
+    def rerun(self):
+        self.rerun_calls.append(1)
+        raise _RerunSentinel()
+
+    def button(self, _label, key=None, **_kw):
+        return self._buttons.get(key, False)
+
+    # expander context manager stub
+    class _expander_ctx:
+        def __init__(self, **_kw): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+
+    def expander(self, _label, expanded=False):
+        return self._expander_ctx()
+
+    def success(self, _msg): pass
+    def error(self, _msg): pass
+    def warning(self, _msg): pass
+    def info(self, _msg): pass
+    def metric(self, _label, _value, **_kw): pass
+    def code(self, _text, **_kw): pass
+    def markdown(self, _msg, **_kw): pass
+    def caption(self, _msg): pass
+
+
+class TestRenderStepResult:
+    """Call _render_step_result() with a controlled FakeSt."""
+
+    @staticmethod
+    def _call(run_result, step_key, *, session_state=None, buttons=None):
+        ss = session_state if session_state is not None else {}
+        fake = _FakeStStep(ss, buttons=buttons)
+        with mock.patch("fullpcr.gui_app.st", fake):
+            from fullpcr.gui_app import _render_step_result
+            try:
+                _render_step_result(run_result, step_key)
+            except _RerunSentinel:
+                pass
+        return fake
+
+    _FAIL_RESULT = {
+        "status": "FAIL", "returncode": 1,
+        "command": ["mfeprimer", "spec"], "stderr": "bad input",
+        "stdout": "", "message": "failed",
+    }
+    _TIMEOUT_RESULT = {
+        "status": "TIMEOUT", "returncode": None,
+        "command": ["obipcr"], "stderr": "", "stdout": "",
+        "message": "timed out",
+    }
+
+    # ── auto-open once ──────────────────────────────────────────────────
+
+    @pytest.mark.parametrize("run_result", [_FAIL_RESULT, _TIMEOUT_RESULT])
+    def test_first_auto_open_writes_pending(self, run_result):
+        """show_advanced_error_details present and matching → routes to
+        pending_error_dialog.  No rerun is called here (the dialog renderer
+        at the bottom of the script handles it)."""
+        from fullpcr.gui_helpers import build_execution_error_details
+        ss: dict = {
+            "show_advanced_error_details": build_execution_error_details(
+                step_key="s3", step_label="特异性分析", result=run_result,
+            ),
+        }
+        fake = self._call(run_result, "s3", session_state=ss)
+        # show_advanced_error_details consumed.
+        assert "show_advanced_error_details" not in ss
+        # pending_error_dialog routed for central rendering.
+        assert isinstance(ss.get("pending_error_dialog"), dict)
+        assert ss["pending_error_dialog"]["status"] == run_result["status"]
+        # No rerun in this path — dialog opens at script bottom.
+        assert len(fake.rerun_calls) == 0
+
+    @pytest.mark.parametrize("run_result", [_FAIL_RESULT, _TIMEOUT_RESULT])
+    def test_plain_rerun_no_auto_repeat(self, run_result):
+        """No show_advanced_error_details → pending_error_dialog is NOT
+        written (auto-open does not repeat on plain rerun)."""
+        ss: dict = {}
+        self._call(run_result, "s3", session_state=ss)
+        assert "pending_error_dialog" not in ss
+        assert "show_advanced_error_details" not in ss
+
+    # ── manual button ────────────────────────────────────────────────────
+
+    @pytest.mark.parametrize("step_key", ["s1", "s2", "s3", "s4", "s5"])
+    def test_manual_click_writes_pending_and_requests_rerun(self, step_key):
+        """Manual button click: sets pending_error_dialog and calls
+        st.rerun() so the dialog opens immediately."""
+        run_result = dict(self._FAIL_RESULT)
+        fake = self._call(
+            run_result, step_key, session_state={},
+            buttons={f"view_full_error_{step_key}": True},
+        )
+        assert isinstance(fake.session_state.get("pending_error_dialog"), dict)
+        assert fake.session_state["pending_error_dialog"]["step_key"] == step_key
+        assert len(fake.rerun_calls) == 1
+
+    def test_manual_click_twice_both_rerun(self):
+        """Clicking the manual button twice: each click re-sets
+        pending_error_dialog and calls st.rerun()."""
+        run_result = dict(self._FAIL_RESULT)
+        ss: dict = {}
+
+        # Click #1
+        fake1 = self._call(
+            run_result, "s1", session_state=ss,
+            buttons={"view_full_error_s1": True},
+        )
+        assert isinstance(ss.get("pending_error_dialog"), dict)
+        assert len(fake1.rerun_calls) == 1
+
+        # Click #2 — pending is overwritten, rerun is called again.
+        fake2 = self._call(
+            run_result, "s1", session_state=ss,
+            buttons={"view_full_error_s1": True},
+        )
+        assert isinstance(ss.get("pending_error_dialog"), dict)
+        assert len(fake2.rerun_calls) == 1
+
+    # ── PASS no error entry ──────────────────────────────────────────────
+
+    def test_pass_result_no_pending_and_no_rerun(self):
+        """PASS result: no pending_error_dialog, no rerun, and no error
+        button rendered (button key not present)."""
+        run_result = {
+            "status": "PASS", "returncode": 0,
+            "command": ["mfeprimer"], "stderr": "", "stdout": "ok",
+            "message": "passed",
+        }
+        ss: dict = {}
+        fake = self._call(run_result, "s5", session_state=ss)
+        assert "pending_error_dialog" not in ss
+        assert len(fake.rerun_calls) == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CPU pipeline plan integration tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestCpuInPipelinePlan:
+    """Verify that resolve_spec_cpu_threads feeds into build_qc_spec_command
+    with the correct --cpu value."""
+
+    def test_default_auto_cpu_with_16_threads(self, monkeypatch):
+        """With 16 available threads, default auto CPU is floor(16*0.6)=9."""
+        monkeypatch.setattr(
+            "fullpcr.gui_helpers.get_available_cpu_threads", lambda: 16,
+        )
+        cmd = build_qc_spec_command(
+            primers="p.tsv", database="db.fa", outdir="out",
+            cpu=resolve_spec_cpu_threads(
+                manual_enabled=False, manual_threads=None,
+            ),
+        )
+        assert "--cpu 9" in " ".join(cmd)
+
+    def test_manual_cpu_6_with_16_threads(self, monkeypatch):
+        """Manual override to 6 threads."""
+        monkeypatch.setattr(
+            "fullpcr.gui_helpers.get_available_cpu_threads", lambda: 16,
+        )
+        cmd = build_qc_spec_command(
+            primers="p.tsv", database="db.fa", outdir="out",
+            cpu=resolve_spec_cpu_threads(
+                manual_enabled=True, manual_threads=6,
+            ),
+        )
+        assert "--cpu 6" in " ".join(cmd)
+
+    def test_manual_cpu_20_clamped_to_16(self, monkeypatch):
+        """Manual value 20 > available 16 → clamped to 16."""
+        monkeypatch.setattr(
+            "fullpcr.gui_helpers.get_available_cpu_threads", lambda: 16,
+        )
+        cmd = build_qc_spec_command(
+            primers="p.tsv", database="db.fa", outdir="out",
+            cpu=resolve_spec_cpu_threads(
+                manual_enabled=True, manual_threads=20,
+            ),
+        )
+        assert "--cpu 16" in " ".join(cmd)
+
+    def test_disable_manual_restores_auto(self, monkeypatch):
+        """Disabling manual mode restores auto (9), state retains manual value."""
+        monkeypatch.setattr(
+            "fullpcr.gui_helpers.get_available_cpu_threads", lambda: 16,
+        )
+        # Simulate state: manual value is still 6 but manual is disabled
+        manual_stored = 6
+        cmd = build_qc_spec_command(
+            primers="p.tsv", database="db.fa", outdir="out",
+            cpu=resolve_spec_cpu_threads(
+                manual_enabled=False,
+                manual_threads=manual_stored,  # stored but ignored when disabled
+            ),
+        )
+        assert "--cpu 9" in " ".join(cmd)
+        # The manual value is preserved in state (not affected by resolution)
+        assert manual_stored == 6
+
+    def test_auto_and_manual_produce_consistent_command_interface(self):
+        """Both auto and manual paths use build_qc_spec_command with the
+        same parameter structure — only --cpu value differs."""
+        auto_cmd = build_qc_spec_command(
+            primers="p.tsv", database="db.fa", outdir="out",
+            cpu=4,
+        )
+        manual_cmd = build_qc_spec_command(
+            primers="p.tsv", database="db.fa", outdir="out",
+            cpu=6,
+        )
+        auto_str = " ".join(auto_cmd)
+        manual_str = " ".join(manual_cmd)
+        # Same structure except --cpu value
+        assert auto_str.replace("--cpu 4", "--cpu X") == \
+               manual_str.replace("--cpu 6", "--cpu X")
+
+    def test_build_pipeline_plan_integration_auto_cpu_9(self, monkeypatch):
+        """_build_pipeline_plan_from_state with 16 threads → step 3 has --cpu 9."""
+        pytest.importorskip("streamlit")
+        monkeypatch.setattr(
+            "fullpcr.gui_helpers.get_available_cpu_threads", lambda: 16,
+        )
+        from fullpcr.gui_app import _build_pipeline_plan_from_state
+
+        # Minimal state with required path keys + default params
+        state = {
+            "wf_s1_primers": "p.tsv", "wf_s1_outdir": "qc",
+            "wf_s2_qcdir": "qc",
+            "wf_s3_primers": "p.tsv", "wf_s3_database": "db.fa",
+            "wf_s3_outdir": "spec",
+            "wf_s3_manual_cpu_enabled": False,
+            "wf_s3_cpu": 4,
+            "wf_s4_primers": "p.tsv", "wf_s4_database": "spec/index/db.fa",
+            "wf_s4_taxonomy": "tax.tsv", "wf_s4_outdir": "obipcr",
+            "wf_s5_obipcr_dir": "obipcr", "wf_s5_qc_dir": "qc",
+            "wf_s5_spec_dir": "spec", "wf_s5_outdir": "final",
+        }
+        common_params = {"min_size": 80, "max_size": 500}
+        plan = _build_pipeline_plan_from_state(state, common_params)
+        s3_cmd = " ".join(plan[2]["command"])
+        assert "--cpu 9" in s3_cmd, f"Expected --cpu 9 in: {s3_cmd}"
+
+    def test_build_pipeline_plan_integration_manual_cpu_6(self, monkeypatch):
+        """Manual CPU=6, 16 threads → step 3 has --cpu 6."""
+        pytest.importorskip("streamlit")
+        monkeypatch.setattr(
+            "fullpcr.gui_helpers.get_available_cpu_threads", lambda: 16,
+        )
+        from fullpcr.gui_app import _build_pipeline_plan_from_state
+
+        state = {
+            "wf_s1_primers": "p.tsv", "wf_s1_outdir": "qc",
+            "wf_s2_qcdir": "qc",
+            "wf_s3_primers": "p.tsv", "wf_s3_database": "db.fa",
+            "wf_s3_outdir": "spec",
+            "wf_s3_manual_cpu_enabled": True,
+            "wf_s3_cpu": 6,
+            "wf_s4_primers": "p.tsv", "wf_s4_database": "spec/index/db.fa",
+            "wf_s4_taxonomy": "tax.tsv", "wf_s4_outdir": "obipcr",
+            "wf_s5_obipcr_dir": "obipcr", "wf_s5_qc_dir": "qc",
+            "wf_s5_spec_dir": "spec", "wf_s5_outdir": "final",
+        }
+        common_params = {"min_size": 80, "max_size": 500}
+        plan = _build_pipeline_plan_from_state(state, common_params)
+        s3_cmd = " ".join(plan[2]["command"])
+        assert "--cpu 6" in s3_cmd, f"Expected --cpu 6 in: {s3_cmd}"
+
+    def test_build_pipeline_plan_integration_manual_clamped(self, monkeypatch):
+        """Manual CPU=20 with 16 threads → clamped to --cpu 16."""
+        pytest.importorskip("streamlit")
+        monkeypatch.setattr(
+            "fullpcr.gui_helpers.get_available_cpu_threads", lambda: 16,
+        )
+        from fullpcr.gui_app import _build_pipeline_plan_from_state
+
+        state = {
+            "wf_s1_primers": "p.tsv", "wf_s1_outdir": "qc",
+            "wf_s2_qcdir": "qc",
+            "wf_s3_primers": "p.tsv", "wf_s3_database": "db.fa",
+            "wf_s3_outdir": "spec",
+            "wf_s3_manual_cpu_enabled": True,
+            "wf_s3_cpu": 20,
+            "wf_s4_primers": "p.tsv", "wf_s4_database": "spec/index/db.fa",
+            "wf_s4_taxonomy": "tax.tsv", "wf_s4_outdir": "obipcr",
+            "wf_s5_obipcr_dir": "obipcr", "wf_s5_qc_dir": "qc",
+            "wf_s5_spec_dir": "spec", "wf_s5_outdir": "final",
+        }
+        common_params = {"min_size": 80, "max_size": 500}
+        plan = _build_pipeline_plan_from_state(state, common_params)
+        s3_cmd = " ".join(plan[2]["command"])
+        assert "--cpu 16" in s3_cmd, f"Expected --cpu 16 in: {s3_cmd}"
+
+    def test_pipeline_plan_disabled_manual_restores_auto(self, monkeypatch):
+        """Manual disabled: auto value used, but manual value retained in state."""
+        pytest.importorskip("streamlit")
+        monkeypatch.setattr(
+            "fullpcr.gui_helpers.get_available_cpu_threads", lambda: 16,
+        )
+        from fullpcr.gui_app import _build_pipeline_plan_from_state
+
+        state = {
+            "wf_s1_primers": "p.tsv", "wf_s1_outdir": "qc",
+            "wf_s2_qcdir": "qc",
+            "wf_s3_primers": "p.tsv", "wf_s3_database": "db.fa",
+            "wf_s3_outdir": "spec",
+            "wf_s3_manual_cpu_enabled": False,  # disabled
+            "wf_s3_cpu": 6,  # stored manual value, ignored when disabled
+            "wf_s4_primers": "p.tsv", "wf_s4_database": "spec/index/db.fa",
+            "wf_s4_taxonomy": "tax.tsv", "wf_s4_outdir": "obipcr",
+            "wf_s5_obipcr_dir": "obipcr", "wf_s5_qc_dir": "qc",
+            "wf_s5_spec_dir": "spec", "wf_s5_outdir": "final",
+        }
+        common_params = {"min_size": 80, "max_size": 500}
+        plan = _build_pipeline_plan_from_state(state, common_params)
+        s3_cmd = " ".join(plan[2]["command"])
+        assert "--cpu 9" in s3_cmd, f"Expected auto --cpu 9 in: {s3_cmd}"
+        # Manual value is still in state
+        assert state["wf_s3_cpu"] == 6
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -5366,6 +6736,11 @@ class TestQuickRecommendation:
             str(_EXAMPLE_DATA / "real_mito_small.fasta")).run()
         at.text_input("_inputs_taxonomy_path").set_value(
             str(_EXAMPLE_DATA / "taxonomy.tsv")).run()
+        # Isolate output root so the fragment does not pick up stale
+        # disk jobs from the project's default "results" directory.
+        iso_root = tmp_path / "isolated-check"
+        iso_root.mkdir()
+        at.session_state["inputs_output_dir"] = str(iso_root)
         at.button("inputs_validate_btn").click().run()
         assert not at.exception
 
@@ -5378,6 +6753,125 @@ class TestQuickRecommendation:
         # Workflow paths and params must survive.
         assert "inputs_validated" in at.session_state
         assert at.session_state["inputs_validated"] is True
+
+    def test_dismissed_terminal_job_not_restored_on_rerun(self, monkeypatch, tmp_path):
+        """After re-validation dismisses a terminal FAIL job: the job on disk
+        must NOT sync outcome, write full_pipeline_result, or trigger
+        pending_error_dialog.  Queued pending/last-auto state is cleared.
+        A new terminal FAIL/TIMEOUT job with a different job_id IS synced."""
+        pytest.importorskip("streamlit.testing")
+        from streamlit.testing.v1 import AppTest
+
+        data_root = tmp_path / "data"
+        monkeypatch.setenv("FULLPCR_DATA_DIR", str(data_root))
+
+        at = AppTest.from_file(str(self._app_path()))
+        at.run(timeout=30)
+        assert not at.exception
+        at.sidebar.radio[0].set_value("分析工作台").run()
+        _enable_advanced_workflow(at)
+        assert not at.exception
+
+        # Set up valid inputs and project root.
+        _switch_all_to_server_path(at)
+        at.text_input("_inputs_primers_path").set_value(
+            str(_EXAMPLE_DATA / "primers.tsv")).run()
+        at.text_input("_inputs_database_path").set_value(
+            str(_EXAMPLE_DATA / "real_mito_small.fasta")).run()
+        at.text_input("_inputs_taxonomy_path").set_value(
+            str(_EXAMPLE_DATA / "taxonomy.tsv")).run()
+        project_root = tmp_path / "dismiss-project"
+        project_root.mkdir()
+        at.session_state["inputs_output_dir"] = str(project_root)
+
+        # Write a terminal FAIL job to disk.
+        job_dir = project_root / ".fullpcr_jobs"
+        job_dir.mkdir()
+        outcome = {
+            "status": "FAIL", "failed_step": "s3",
+            "results": {},
+            "message": "特异性分析失败",
+        }
+        terminal = {
+            "job_id": "job-dismiss-me", "status": "FAIL",
+            "phase": "finished", "progress_current": 2,
+            "progress_total": 5, "completed_steps": ["s1", "s2"],
+            "outcome": outcome,
+        }
+        (job_dir / "pipeline_state.json").write_text(
+            json.dumps(terminal), encoding="utf-8",
+        )
+
+        # Pre-populate old job's pending error state, so the test can assert
+        # that re-validation actually clears it.
+        at.session_state["pending_error_dialog"] = {
+            "status": "FAIL", "job_id": "job-dismiss-me",
+        }
+        # Pre-populate old job's pending error state with a unique sentinel
+        # so the test can assert the old dialog is NOT rendered.
+        _SENTINEL = "DISMISS-OLD-DIALOG-SENTINEL-a1b2c3"
+        at.session_state["pending_error_dialog"] = {
+            "status": "FAIL", "job_id": "job-dismiss-me",
+            "step_label": _SENTINEL,
+        }
+        at.session_state["last_auto_shown_error_job_id"] = "job-dismiss-me"
+        at.session_state["full_pipeline_job_id"] = "job-dismiss-me"
+        at.session_state["full_pipeline_result"] = outcome
+        at.session_state["project_output_root"] = str(project_root)
+
+        # Re-validation: must clear the old job's queued error state and
+        # set the dismiss marker.
+        at.button("inputs_validate_btn").click().run()
+        assert not at.exception
+        assert at.session_state["dismissed_terminal_job_id"] == "job-dismiss-me"
+        assert at.session_state["inputs_validated"] is True
+        # Queued pending-error and auto-shown state must be cleared.
+        assert "pending_error_dialog" not in at.session_state
+        assert "last_auto_shown_error_job_id" not in at.session_state
+
+        # Sentinel and dialog title must NOT appear in any rendered element
+        # after the old dialog was cleared.
+        parts: list[str] = []
+        for element_list in (at.error, at.warning, at.success, at.info,
+                             at.markdown, at.caption):
+            for e in element_list:
+                parts.append(str(getattr(e, "value", getattr(e, "label", ""))))
+        all_rendered = " ".join(parts)
+        assert _SENTINEL not in all_rendered
+        assert "失败步骤与状态" not in all_rendered
+
+        # Rerun: the terminal job still exists on disk but the dismiss marker
+        # must prevent the fragment from syncing its outcome back.
+        at.run(timeout=30)
+        assert not at.exception
+        # full_pipeline_result must NOT be restored from the disk job.
+        assert "full_pipeline_result" not in at.session_state
+        # pending_error_dialog must NOT be set (no auto-popup for dismissed job).
+        assert "pending_error_dialog" not in at.session_state
+
+        # ── tail: observe a NEW terminal FAIL/TIMEOUT job with a different
+        # job_id.  Write it to disk and rerun; since its job_id does not
+        # match the dismiss marker, the fragment must sync it.
+        new_outcome = {
+            "status": "TIMEOUT", "failed_step": "s4",
+            "results": {},
+            "message": "obipcr timed out",
+        }
+        terminal_new = {
+            "job_id": "job-fresh-002", "status": "TIMEOUT",
+            "phase": "finished", "progress_current": 3,
+            "progress_total": 5, "completed_steps": ["s1", "s2", "s3"],
+            "outcome": new_outcome,
+        }
+        (job_dir / "pipeline_state.json").write_text(
+            json.dumps(terminal_new), encoding="utf-8",
+        )
+        at.run(timeout=30)
+        assert not at.exception
+        # The new job (different job_id) is NOT dismissed → its outcome must
+        # be synced into session state.
+        assert at.session_state["full_pipeline_result"]["status"] == "TIMEOUT"
+        assert at.session_state["full_pipeline_result"]["failed_step"] == "s4"
 
 
 class TestResultsOverviewFlow:

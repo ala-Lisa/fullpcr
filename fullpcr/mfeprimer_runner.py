@@ -328,7 +328,7 @@ def run_mfeprimer_qc_job(
         if proc.returncode != 0:
             stderr_path.write_text(proc.stderr, encoding="utf-8")
             error_msg = (
-                proc.stderr.strip()[:500]
+                proc.stderr.strip()
                 if proc.stderr.strip()
                 else f"mfeprimer 返回非零退出码: {proc.returncode}"
             )

@@ -183,7 +183,7 @@ def run_obipcr_job(
 
         if proc.returncode != 0:
             error_msg = (
-                proc.stderr.strip()[:500]
+                proc.stderr.strip()
                 if proc.stderr.strip()
                 else f"obipcr 返回非零退出码: {proc.returncode}"
             )

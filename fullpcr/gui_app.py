@@ -19,6 +19,7 @@ import streamlit as st
 from fullpcr.gui_helpers import (
     _WORKFLOW_PATH_MAP,
     apply_project_paths_to_state,
+    build_execution_error_details,
     build_final_report_command,
     build_full_pipeline_plan,
     build_manual_primers_tsv,
@@ -33,6 +34,7 @@ from fullpcr.gui_helpers import (
     compute_inputs_validated,
     derive_project_paths,
     ensure_widget_key,
+    get_available_cpu_threads,
     get_effective_database_path,
     get_effective_primers_path,
     get_effective_taxonomy_path,
@@ -43,6 +45,7 @@ from fullpcr.gui_helpers import (
     load_markdown_file,
     load_primer_rank,
     load_tsv_file,
+    resolve_spec_cpu_threads,
     run_gui_command,
     should_refresh_environment_status,
     summarize_primer_rank,
@@ -803,8 +806,15 @@ def _build_pipeline_plan_from_state(state, common_params):
     s3_outdir = _read_state_value(state, "_wf_s3_outdir", "wf_s3_outdir")
     s3_tm = _read_state_value(state, "_wf_s3_tm", "wf_s3_tm", 50.0)
     s3_maxtm = _read_state_value(state, "_wf_s3_maxtm", "wf_s3_maxtm", 100.0)
-    s3_cpu = _read_state_value(state, "_wf_s3_cpu", "wf_s3_cpu", 4)
+    s3_manual_enabled = _read_state_value(
+        state, "_wf_s3_manual_cpu_enabled", "wf_s3_manual_cpu_enabled", False
+    )
+    s3_manual_cpu = _read_state_value(state, "_wf_s3_cpu", "wf_s3_cpu", 4)
     s3_kvalue = _read_state_value(state, "_wf_s3_kvalue", "wf_s3_kvalue", 9)
+    s3_cpu = resolve_spec_cpu_threads(
+        manual_enabled=bool(s3_manual_enabled),
+        manual_threads=int(s3_manual_cpu) if s3_manual_cpu is not None else None,
+    )
     s3_force = _read_state_value(state, "_wf_s3_force", "wf_s3_force", True)
 
     s4_primers = _read_state_value(state, "_wf_s4_primers", "wf_s4_primers")
@@ -894,6 +904,34 @@ def _render_full_pipeline_outcome(outcome: dict | None) -> None:
     else:
         # Unknown status — treat as failure.
         st.warning(outcome.get("message", "流程状态未知。"))
+
+    # Show "查看完整错误" button for FAIL/TIMEOUT background pipeline jobs
+    if status in ("FAIL", "TIMEOUT"):
+        job_id = st.session_state.get("full_pipeline_job_id", "")
+        job = get_pipeline_job(
+            st.session_state.get("project_output_root", "")
+        ) if job_id else {}
+
+        error_details = _extract_pipeline_error_details(outcome, job)
+        if error_details is None:
+            return  # PASS/CANCELLED handled above, defensive guard
+
+        # Auto-popup: only once per job_id, via pending_error_dialog.
+        # Trigger a full script rerun so the outer dialog renderer (outside
+        # this fragment) gets a chance to open the dialog.  Dedup via
+        # last_auto_shown_error_job_id prevents infinite rerun loops.
+        if job_id and job_id != st.session_state.get("last_auto_shown_error_job_id", ""):
+            st.session_state["last_auto_shown_error_job_id"] = job_id
+            st.session_state["pending_error_dialog"] = error_details
+            st.rerun()
+
+        # Manual button: also routes through pending_error_dialog.
+        # Trigger a full script rerun so the outer dialog renderer opens
+        # the dialog immediately.  Does NOT touch last_auto_shown_error_job_id
+        # so manual clicks never interfere with auto-popup dedup.
+        if st.button("查看完整错误", key="view_full_error_pipeline"):
+            st.session_state["pending_error_dialog"] = error_details
+            st.rerun()
 
 
 def _flag_value(cmd: list[str], flag: str) -> str | None:
@@ -1017,6 +1055,68 @@ _PIPELINE_STEP_LABELS = {
 }
 
 
+def _extract_pipeline_error_details(outcome: dict | None, job: dict) -> dict | None:
+    """Centralised pipeline error-detail extraction.
+
+    Returns ``None`` for PASS and CANCELLED (no error dialog needed).
+    For FAIL / TIMEOUT returns a dict ready for the unified dialog.
+
+    When *outcome* is ``None`` (background exception), the terminal *job*
+    status and message are used as fallback so the dialog displays FAIL
+    or TIMEOUT while retaining background error and traceback.
+    """
+    status = outcome.get("status", "") if outcome else job.get("status", "FAIL")
+
+    if status in ("PASS", "CANCELLED"):
+        return None
+
+    job_id = job.get("job_id", "")
+    bg_error = str(job.get("error", ""))
+    bg_traceback = str(job.get("traceback", ""))
+
+    failed_key = outcome.get("failed_step", "") if outcome else ""
+    step_label = _PIPELINE_STEP_LABELS.get(failed_key, failed_key)
+
+    # Try to locate the per-step result for the failed step.  Only use it
+    # when the value is actually a dict; otherwise fall back through
+    # outcome → job so the dialog always has a correct FAIL/TIMEOUT status.
+    step_result = None
+    if outcome and outcome.get("results") and failed_key:
+        candidate = outcome["results"].get(f"wf_{failed_key}_result")
+        if isinstance(candidate, dict):
+            step_result = candidate
+
+    if step_result is None:
+        if outcome:
+            step_result = {
+                "status": outcome.get("status") or job.get("status", "FAIL"),
+                "returncode": None,
+                "command": [],
+                "stderr": "",
+                "stdout": "",
+                "message": outcome.get("message") or job.get("error", ""),
+            }
+        else:
+            # outcome=None or no per-step result: use terminal job status/message
+            step_result = {
+                "status": job.get("status", "FAIL"),
+                "returncode": None,
+                "command": [],
+                "stderr": "",
+                "stdout": "",
+                "message": job.get("error", ""),
+            }
+
+    return build_execution_error_details(
+        step_key=failed_key,
+        step_label=step_label,
+        result=step_result,
+        job_id=job_id,
+        background_error=bg_error,
+        background_traceback=bg_traceback,
+    )
+
+
 def _parse_pipeline_time(value: object) -> datetime | None:
     if not isinstance(value, str):
         return None
@@ -1121,7 +1221,12 @@ def _render_pipeline_job_controls(
     job = get_pipeline_job(project_root) if project_root else None
     running = bool(job and job.get("status") == "RUNNING")
 
-    if job and not running:
+    # Skip restoring outcome for a terminal job that was dismissed via
+    # re-validation — the user has explicitly invalidated those results.
+    dismissed = st.session_state.get("dismissed_terminal_job_id", "")
+    if dismissed and job and not running and job.get("job_id") == dismissed:
+        pass  # Suppress outcome restoration for this job
+    elif job and not running:
         _sync_pipeline_job_outcome(job)
 
     clicked = st.button(
@@ -1131,6 +1236,8 @@ def _render_pipeline_job_controls(
         disabled=base_disabled or running,
     )
     if clicked:
+        # New job: clear any previous dismissal marker
+        st.session_state.pop("dismissed_terminal_job_id", None)
         st.session_state["full_pipeline_plan"] = plan
         for result_key in [
             "wf_s1_result",
@@ -1170,11 +1277,30 @@ def _render_pipeline_job_controls(
             else:
                 st.error(str(cancel_result.get("error", "无法终止当前分析。")))
     if job and job.get("status") != "RUNNING":
-        outcome = _sync_pipeline_job_outcome(job)
-        if outcome is not None:
-            _render_full_pipeline_outcome(outcome)
-            if outcome.get("status") == "PASS":
-                st.info("分析结果已生成，请前往左侧「结果总览」查看推荐与详细结果。")
+        dismissed = st.session_state.get("dismissed_terminal_job_id", "")
+        if dismissed and job.get("job_id") == dismissed:
+            # Suppress all sync, state writes, and error dialogs for a
+            # terminal job the user explicitly dismissed via re-validation.
+            pass
+        else:
+            # Always store job_id before inspecting outcome.
+            st.session_state["full_pipeline_job_id"] = job.get("job_id", "")
+            outcome = _sync_pipeline_job_outcome(job)
+            if outcome is not None:
+                _render_full_pipeline_outcome(outcome)
+                if outcome.get("status") == "PASS":
+                    st.info("分析结果已生成，请前往左侧「结果总览」查看推荐与详细结果。")
+            elif job.get("status") in ("FAIL", "TIMEOUT"):
+                # Background exception: no outcome dict, but error + traceback available.
+                # Build synthetic outcome so the error dialog can render.
+                synthetic = {
+                    "status": job.get("status", "FAIL"),
+                    "failed_step": "",
+                    "results": {},
+                    "message": job.get("error", "后台任务异常。"),
+                }
+                st.session_state["full_pipeline_result"] = synthetic
+                _render_full_pipeline_outcome(synthetic)
     elif job is None:
         # Preserve results created before the persistent job manager existed,
         # or injected by an existing advanced workflow/session.
@@ -1183,6 +1309,7 @@ def _render_pipeline_job_controls(
             _render_full_pipeline_outcome(previous)
             if previous.get("status") == "PASS":
                 st.info("分析结果已生成，请前往左侧「结果总览」查看推荐与详细结果。")
+
 
 def _render_quick_analysis(common_params) -> None:
     """Render the one-click pipeline runner section."""
@@ -2391,6 +2518,16 @@ def _render_project_inputs() -> None:
             "wf_s4_result", "wf_s5_result",
         ]:
             st.session_state.pop(rk, None)
+        # Clear queued error state from the previous pipeline run so
+        # the old dialog does not render after re-validation.
+        st.session_state.pop("pending_error_dialog", None)
+        st.session_state.pop("last_auto_shown_error_job_id", None)
+        # Dismiss the current terminal job so stale results don't
+        # reappear after re-validation.
+        old_job_id = st.session_state.get("full_pipeline_job_id", "")
+        if old_job_id:
+            st.session_state["dismissed_terminal_job_id"] = old_job_id
+        st.session_state.pop("full_pipeline_job_id", None)
         _clear_result_download_state()
 
         ws = None
@@ -3069,6 +3206,55 @@ def _render_workflow_status_row() -> None:
 # ── step result helper ───────────────────────────────────────────────────────
 
 
+@st.dialog("分析失败", width="large")
+def _render_error_dialog(error_details: dict) -> None:
+    """Unified error dialog — used by both one-click and advanced steps.
+
+    Displays all raw error fields without truncation in fixed order.
+    Command, stderr, stdout, and traceback are rendered via
+    ``st.code(..., language=None)``.  Empty textual fields show
+    "（无内容）" and a missing return-code shows the same placeholder.
+    """
+    def _code_block(value: object) -> None:
+        text = str(value) if value else ""
+        st.code(text if text else "（无内容）", language=None)
+
+    def _inline_or_placeholder(value: object) -> str:
+        text = str(value) if value is not None and value != "" else ""
+        return text if text else "（无内容）"
+
+    # Fixed-section order per the approved plan.
+    st.markdown(
+        f"**失败步骤与状态:** "
+        f"{_inline_or_placeholder(error_details.get('step_label'))}"
+        f" — {translate_status(error_details.get('status', ''))}"
+    )
+    st.markdown(
+        f"**后台任务ID:** "
+        f"{_inline_or_placeholder(error_details.get('job_id'))}"
+    )
+    st.markdown(
+        f"**返回码:** "
+        f"{_inline_or_placeholder(error_details.get('returncode'))}"
+    )
+    st.markdown("**实际执行命令:**")
+    _code_block(error_details.get("command"))
+    st.markdown("**原始 stderr:**")
+    _code_block(error_details.get("stderr"))
+    st.markdown("**原始 stdout:**")
+    _code_block(error_details.get("stdout"))
+    st.markdown(
+        f"**执行消息:** "
+        f"{_inline_or_placeholder(error_details.get('message'))}"
+    )
+    st.markdown(
+        f"**后台异常:** "
+        f"{_inline_or_placeholder(error_details.get('background_error'))}"
+    )
+    st.markdown("**后台 Python traceback:**")
+    _code_block(error_details.get("background_traceback"))
+
+
 def _render_step_result(run_result: dict | None, step_key: str) -> None:
     """Display the result of a command execution.
 
@@ -3103,6 +3289,35 @@ def _render_step_result(run_result: dict | None, step_key: str) -> None:
     if stderr_text:
         with st.expander("查看错误信息"):
             st.code(stderr_text, language=None)
+
+    # Show "查看完整错误" button for FAIL, TIMEOUT, or CANCELLED results
+    if status in ("FAIL", "TIMEOUT", "CANCELLED"):
+        step_label_map = {
+            "s1": "基础质控", "s2": "质控汇总", "s3": "特异性分析",
+            "s4": "obipcr 全库模拟 PCR", "s5": "最终综合报告",
+        }
+        # Auto-open dialog only for FAIL/TIMEOUT (not CANCELLED)
+        if status in ("FAIL", "TIMEOUT"):
+            error_details = st.session_state.get("show_advanced_error_details")
+            has_pending = (
+                isinstance(error_details, dict)
+                and error_details.get("step_key") == step_key
+            )
+            if has_pending:
+                # Route through pending_error_dialog for centralised rendering
+                st.session_state.pop("show_advanced_error_details", None)
+                st.session_state["pending_error_dialog"] = error_details
+
+        # Manual "查看完整错误" button — also routes through pending_error_dialog.
+        # Calls st.rerun() so the outer dialog renderer opens immediately.
+        if st.button("查看完整错误", key=f"view_full_error_{step_key}"):
+            manual_details = build_execution_error_details(
+                step_key=step_key,
+                step_label=step_label_map.get(step_key, step_key),
+                result=run_result,
+            )
+            st.session_state["pending_error_dialog"] = manual_details
+            st.rerun()
 
 
 # ── workflow tabs ────────────────────────────────────────────────────────────
@@ -3182,6 +3397,10 @@ def _render_workflow_step_1() -> None:
             with st.spinner("正在运行基础质控..."):
                 result = run_gui_command(s1_cmd, timeout=None)
                 st.session_state["wf_s1_result"] = result
+                if result.get("status") in ("FAIL", "TIMEOUT"):
+                    st.session_state["show_advanced_error_details"] = build_execution_error_details(
+                        step_key="s1", step_label="基础质控", result=result,
+                    )
     _render_step_result(st.session_state.get("wf_s1_result"), "s1")
 
 
@@ -3210,6 +3429,10 @@ def _render_workflow_step_2() -> None:
             with st.spinner("正在生成质控汇总..."):
                 result = run_gui_command(s2_cmd)
                 st.session_state["wf_s2_result"] = result
+                if result.get("status") in ("FAIL", "TIMEOUT"):
+                    st.session_state["show_advanced_error_details"] = build_execution_error_details(
+                        step_key="s2", step_label="质控汇总", result=result,
+                    )
     _render_step_result(st.session_state.get("wf_s2_result"), "s2")
 
 
@@ -3242,8 +3465,38 @@ def _render_workflow_step_3(common_params: dict) -> None:
     with st.expander("高级参数"):
         as3c1, as3c2 = st.columns(2)
         with as3c1:
-            ensure_widget_key(st.session_state, "_wf_s3_cpu")
-            s3_cpu = st.number_input("cpu", key="_wf_s3_cpu")
+            available_cpu = get_available_cpu_threads()
+            auto_cpu = resolve_spec_cpu_threads(
+                manual_enabled=False, manual_threads=None,
+                available_threads=available_cpu,
+            )
+            ensure_widget_key(st.session_state, "_wf_s3_manual_cpu_enabled")
+            s3_manual_enabled = st.toggle(
+                "手动指定 CPU 线程数",
+                key="_wf_s3_manual_cpu_enabled",
+            )
+            if s3_manual_enabled:
+                # Clamp persisted value to current [1, available_cpu] range
+                ensure_widget_key(st.session_state, "_wf_s3_cpu")
+                persisted = st.session_state.get("_wf_s3_cpu")
+                if isinstance(persisted, (int, float)):
+                    st.session_state["_wf_s3_cpu"] = max(
+                        1, min(int(persisted), available_cpu),
+                    )
+                s3_cpu_widget = st.number_input(
+                    "cpu",
+                    key="_wf_s3_cpu",
+                    min_value=1,
+                    max_value=available_cpu,
+                    step=1,
+                )
+            else:
+                st.caption(
+                    f"自动使用 {auto_cpu} 个线程"
+                    f"（当前进程可用 {available_cpu} 个逻辑线程的 60%）"
+                )
+                # Resolve auto value for downstream use
+                s3_cpu_widget = auto_cpu
         with as3c2:
             ensure_widget_key(st.session_state, "_wf_s3_maxtm")
             s3_max_tm = st.number_input("max_tm", key="_wf_s3_maxtm")
@@ -3253,6 +3506,12 @@ def _render_workflow_step_3(common_params: dict) -> None:
         s3_force = st.checkbox("Force（覆盖已有结果）", key="_wf_s3_force")
 
     with st.expander("查看实际执行命令"):
+        # Use resolved CPU for both preview and execution
+        s3_resolved_cpu = resolve_spec_cpu_threads(
+            manual_enabled=bool(s3_manual_enabled),
+            manual_threads=int(s3_cpu_widget) if isinstance(s3_cpu_widget, (int, float)) else None,
+            available_threads=available_cpu,
+        )
         s3_cmd = build_qc_spec_command(
             primers=s3_primers,
             database=s3_database,
@@ -3264,7 +3523,7 @@ def _render_workflow_step_3(common_params: dict) -> None:
             mismatch=common_params["spec_mismatch"],
             mis_start=common_params.get("spec_mis_start"),
             mis_end=common_params.get("spec_mis_end"),
-            cpu=s3_cpu,
+            cpu=s3_resolved_cpu,
             kvalue=s3_kvalue,
             bind=common_params.get("spec_bind", False),
             cut_primer=common_params.get("spec_cut_primer", False),
@@ -3288,6 +3547,13 @@ def _render_workflow_step_3(common_params: dict) -> None:
             with st.spinner("正在运行特异性分析..."):
                 result = run_gui_command(s3_cmd, timeout=None)
                 st.session_state["wf_s3_result"] = result
+                # Auto-open error dialog for FAIL/TIMEOUT on this click
+                if result.get("status") in ("FAIL", "TIMEOUT"):
+                    st.session_state["show_advanced_error_details"] = build_execution_error_details(
+                        step_key="s3",
+                        step_label="特异性分析",
+                        result=result,
+                    )
     _render_step_result(st.session_state.get("wf_s3_result"), "s3")
 
 
@@ -3358,6 +3624,10 @@ def _render_workflow_step_4(common_params: dict) -> None:
             with st.spinner("正在运行 obipcr 全库模拟 PCR..."):
                 result = run_gui_command(s4_cmd, timeout=None)
                 st.session_state["wf_s4_result"] = result
+                if result.get("status") in ("FAIL", "TIMEOUT"):
+                    st.session_state["show_advanced_error_details"] = build_execution_error_details(
+                        step_key="s4", step_label="obipcr 全库模拟 PCR", result=result,
+                    )
     _render_step_result(st.session_state.get("wf_s4_result"), "s4")
 
 
@@ -3413,6 +3683,10 @@ def _render_workflow_step_5() -> None:
             with st.spinner("正在生成最终综合报告..."):
                 result = run_gui_command(s5_cmd)
                 st.session_state["wf_s5_result"] = result
+                if result.get("status") in ("FAIL", "TIMEOUT"):
+                    st.session_state["show_advanced_error_details"] = build_execution_error_details(
+                        step_key="s5", step_label="最终综合报告", result=result,
+                    )
     _render_step_result(st.session_state.get("wf_s5_result"), "s5")
 
 
@@ -3512,6 +3786,15 @@ elif page == "结果总览":
 
 elif page == "报告与下载":
     _render_reports_and_downloads()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Centralised error-dialog rendering (once per script run, any page)
+# ═══════════════════════════════════════════════════════════════════════════
+
+pending_dialog = st.session_state.get("pending_error_dialog")
+if isinstance(pending_dialog, dict):
+    _render_error_dialog(pending_dialog)
+    st.session_state.pop("pending_error_dialog", None)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Cross-page persistence: sync widget → canonical

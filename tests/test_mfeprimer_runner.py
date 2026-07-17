@@ -775,3 +775,37 @@ class TestQcFailedJobsFieldnames:
     def test_contains_required_keys(self):
         required = {"module", "command", "output", "status", "error_message"}
         assert set(QC_FAILED_JOBS_FIELDNAMES) == required
+
+
+class TestLongStderrNotTruncated:
+    """Regression: >500 char stderr is NOT truncated after the [:500] removal."""
+
+    def test_long_stderr_preserved_in_full(self, tmp_path):
+        """mfeprimer stderr longer than 500 chars is preserved in full."""
+        long_stderr = "START-" + ("y" * 600) + "-END"
+        config = _make_config("spec")
+        raw = tmp_path / "spec_raw.txt"
+        stderr_p = tmp_path / "spec.stderr.log"
+
+        with mock.patch(
+            "fullpcr.mfeprimer_runner.check_mfeprimer_available",
+            return_value=True,
+        ):
+            with mock.patch(
+                "fullpcr.mfeprimer_runner.subprocess.run",
+                return_value=_completed_process(
+                    stdout="", stderr=long_stderr, returncode=1
+                ),
+            ):
+                result = run_mfeprimer_qc_job(
+                    module="spec",
+                    config=config,
+                    raw_path=raw,
+                    stderr_path=stderr_p,
+                )
+
+        assert result["status"] == "failed"
+        error_msg = result["error_message"]
+        assert error_msg.startswith("START-")
+        assert error_msg.endswith("-END")
+        assert len(error_msg) > 500

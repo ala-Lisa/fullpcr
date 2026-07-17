@@ -378,3 +378,61 @@ class TestPipelineJobManager:
         state = json.loads((job_dir / "pipeline_state.json").read_text())
         assert state["status"] == "PASS"
         assert list(job_dir.glob(".pipeline-state-*")) == []
+
+
+class TestPipelineJobTraceback:
+    """Traceback is persisted on background exceptions."""
+
+    def test_runner_exception_persists_traceback(self, tmp_path):
+        """Runner raises: terminal state is FAIL with traceback field."""
+        root = tmp_path / "project"
+        root.mkdir()
+
+        def failing_runner(command, *, timeout):
+            raise RuntimeError("something broke")
+
+        started = start_pipeline_job(str(root), _plan(), runner=failing_runner)
+        assert started["started"] is True
+        terminal = _wait_terminal(root)
+        assert terminal["status"] == "FAIL"
+        assert terminal["error"] != ""
+        assert terminal["traceback"] != ""
+        assert "RuntimeError" in terminal["traceback"]
+        assert "something broke" in terminal["traceback"]
+        assert "Traceback" in terminal["traceback"]
+
+    def test_passed_steps_have_empty_traceback(self, tmp_path):
+        """PASS result has empty traceback in final state."""
+        root = tmp_path / "project"
+        root.mkdir()
+
+        def ok_runner(command, *, timeout):
+            return {"status": "PASS"}
+
+        started = start_pipeline_job(str(root), _plan(), runner=ok_runner)
+        assert started["started"] is True
+        terminal = _wait_terminal(root)
+        assert terminal["status"] == "PASS"
+        assert terminal["traceback"] == ""
+
+    def test_legacy_state_without_traceback_still_readable(self, tmp_path):
+        """Old state JSON without 'traceback' key can still be read."""
+        root = tmp_path / "project"
+        root.mkdir()
+        job_dir = root / ".fullpcr_jobs"
+        job_dir.mkdir()
+        legacy_state = {
+            "schema_version": 1,
+            "job_id": "legacy-123",
+            "status": "FAIL",
+            "error": "old error",
+        }
+        (job_dir / "pipeline_state.json").write_text(
+            json.dumps(legacy_state), encoding="utf-8"
+        )
+        got = get_pipeline_job(str(root))
+        assert got is not None
+        assert got["job_id"] == "legacy-123"
+        assert got["status"] == "FAIL"
+        # Missing traceback should NOT cause an error; treated as empty
+        assert got.get("traceback", "") == ""

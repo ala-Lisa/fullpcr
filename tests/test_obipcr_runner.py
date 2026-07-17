@@ -747,3 +747,31 @@ class TestRunObipcrJob:
         assert result["status"] == "success"
         # Verify timeout=None was passed
         assert mock_run.call_args[1].get("timeout") is None
+
+    def test_long_stderr_not_truncated(self, tmp_path, monkeypatch):
+        """Stderr longer than 500 characters is preserved in full."""
+        monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/obipcr")
+        long_stderr = "START-" + ("x" * 600) + "-END"
+
+        def _mock_long_stderr(*args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=kwargs.get("args", []),
+                returncode=1,
+                stdout="",
+                stderr=long_stderr,
+            )
+
+        monkeypatch.setattr(subprocess, "run", _mock_long_stderr)
+        output = tmp_path / "COI" / "mismatch_0" / "obipcr_amplicons.fasta"
+        config = _make_config(str(output))
+        result = run_obipcr_job(
+            primer_id="COI", mismatch=0, config=config,
+        )
+
+        assert result["status"] == "failed"
+        error_msg = result["error_message"]
+        assert error_msg.startswith("START-")
+        assert error_msg.endswith("-END")
+        assert len(error_msg) >= 610
+        # Must NOT be truncated to 500 chars
+        assert len(error_msg) > 500

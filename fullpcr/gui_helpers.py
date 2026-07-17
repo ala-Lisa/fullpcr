@@ -1389,6 +1389,7 @@ _CANONICAL_DEFAULTS: dict[str, object] = {
     "wf_s3_minsize": 80, "wf_s3_maxsize": 500, "wf_s3_mismatch": 2,
     "wf_s3_tm": 50.0, "wf_s3_maxtm": 100.0, "wf_s3_cpu": 4,
     "wf_s3_kvalue": 9, "wf_s3_force": True,
+    "wf_s3_manual_cpu_enabled": False,
     # Phase 3D-2: spec custom params (None = use MFEprimer default)
     "wf_s3_use_tm": False,
     "wf_s3_use_misstart": False, "wf_s3_use_misend": False,
@@ -1954,6 +1955,148 @@ def apply_primer_preset_to_state(
         if val is not None:
             state[state_key] = val
             state[_widget_key(state_key)] = val
+
+
+# ── CPU thread helpers ───────────────────────────────────────────────────
+
+
+def get_available_cpu_threads() -> int:
+    """Return the number of logical CPU threads available to the current process.
+
+    Uses ``os.sched_getaffinity(0)`` (Linux) when available; falls back to
+    ``os.cpu_count()``.  Returns at least 1 even when every source is
+    ``None`` or invalid.
+
+    Returns:
+        int: Available logical CPU threads (≥ 1).
+    """
+    try:
+        affinity = os.sched_getaffinity(0)  # type: ignore[attr-defined]
+    except (AttributeError, NotImplementedError, OSError):
+        affinity = None
+
+    if affinity is not None and len(affinity) > 0:
+        return max(1, len(affinity))
+
+    cpu_count = os.cpu_count()
+    if cpu_count is not None and cpu_count > 0:
+        return cpu_count
+
+    return 1
+
+
+def calculate_auto_cpu_threads(available_threads: int) -> int:
+    """Return 60% of *available_threads*, floored, with a minimum of 1.
+
+    Args:
+        available_threads: Total logical threads available (≥ 0).
+
+    Returns:
+        int: At least 1, at most *available_threads*.
+    """
+    auto = max(1, int(available_threads * 0.6))
+    return auto
+
+
+def resolve_spec_cpu_threads(
+    *,
+    manual_enabled: bool,
+    manual_threads: int | None,
+    available_threads: int | None = None,
+) -> int:
+    """Resolve the final CPU thread count for MFEprimer spec.
+
+    When *manual_enabled* is ``True`` and *manual_threads* is a positive
+    integer, the value is clamped to ``[1, available_threads]``.  When
+    *manual_enabled* is ``False``, or *manual_threads* is ``None``, the
+    automatic 60% value is used.
+
+    Args:
+        manual_enabled: Whether the user has enabled manual override.
+        manual_threads: User-entered thread count, or ``None``.
+        available_threads: Total available threads; ``None`` defaults to 1.
+
+    Returns:
+        int: Resolved thread count (≥ 1, ≤ available_threads).
+    """
+    if available_threads is None:
+        available_threads = get_available_cpu_threads()
+    available_threads = max(1, available_threads)
+
+    if manual_enabled and manual_threads is not None:
+        if manual_threads < 0:
+            return calculate_auto_cpu_threads(available_threads)
+        clamped = max(1, min(manual_threads, available_threads))
+        return clamped
+
+    return calculate_auto_cpu_threads(available_threads)
+
+
+# ── execution error details ──────────────────────────────────────────────
+
+
+def build_execution_error_details(
+    *,
+    step_key: str,
+    step_label: str,
+    result: dict | None,
+    job_id: str | None = None,
+    background_error: str = "",
+    background_traceback: str = "",
+) -> dict:
+    """Build a structured error-details dict for the unified error dialog.
+
+    All raw text fields are preserved in full — no truncation, translation,
+    or sanitisation.  Missing values are normalised to empty strings so
+    callers can render unconditionally.
+
+    Args:
+        step_key: Short step identifier (``"s1"`` … ``"s5"``).
+        step_label: Human-readable step label (``"基础质控"`` …).
+        result: The per-step result dict returned by :func:`run_gui_command`
+            (or ``None`` when no result is available, e.g. a background
+            exception).
+        job_id: Optional background job id for correlation.
+        background_error: High-level error message from the pipeline
+            orchestrator (empty string when not applicable).
+        background_traceback: Full Python traceback captured in the
+            background thread (empty string when not applicable).
+
+    Returns:
+        dict with keys ``step_key``, ``step_label``, ``job_id``,
+        ``status``, ``returncode``, ``command``, ``stderr``, ``stdout``,
+        ``message``, ``background_error``, ``background_traceback``.
+    """
+    if result is None:
+        result = {}
+
+    command_raw = result.get("command")
+    if isinstance(command_raw, (list, tuple)):
+        command_str = " ".join(str(p) for p in command_raw)
+    elif isinstance(command_raw, str):
+        command_str = command_raw
+    else:
+        command_str = ""
+
+    def _str_or_empty(value: object) -> str:
+        """Normalise *value* to string, mapping None to empty string."""
+        if value is None:
+            return ""
+        return str(value)
+
+    return {
+        "step_key": step_key or "",
+        "step_label": step_label or "",
+        "job_id": job_id or "",
+        "status": _str_or_empty(result.get("status")),
+        "returncode": _str_or_empty(result.get("returncode")),
+        "command": command_str,
+        "stderr": _str_or_empty(result.get("stderr")),
+        "stdout": _str_or_empty(result.get("stdout")),
+        "message": _str_or_empty(result.get("message")),
+        "background_error": _str_or_empty(background_error),
+        "background_traceback": _str_or_empty(background_traceback),
+    }
 
 
 # ── Phase 3D-3A: raw spec TSV + results archive ──────────────────────────
