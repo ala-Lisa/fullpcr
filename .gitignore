@@ -38,9 +38,12 @@ build/
 
 # Protected: project files
 !README.md
-!CLAUDE.md
 !pyproject.toml
 
 # Protected: source
 !tests/
 !fullpcr/
+
+# Internal agent working documents (not release artifacts)
+CLAUDE.md
+docs/superpowers/
